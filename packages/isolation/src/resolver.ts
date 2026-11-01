@@ -1,0 +1,680 @@
+import type { WorktreeSetupExecutor } from './types';
+/**
+ * IsolationResolver — encapsulates all isolation resolution logic.
+ *
+ * The resolver determines which isolation environment to use (existing, reusable,
+ * adopted, or new) without any platform messaging. It returns rich discriminated
+ * union results; the caller handles messaging and DB updates.
+ */
+
+import { createLogger } from '@archon/paths';
+import {
+  worktreeExists,
+  toWorktreePath,
+  getCanonicalRepoPath,
+  findWorktreeByBranch,
+  toBranchName,
+  isSameWorktreePath,
+  isAncestorOf,
+  verifyWorktreeOwnership,
+  CanonicalRepoPathUnavailableError,
+  toRepoPath,
+} from '@archon/git';
+import type { RepoPath, BranchName, WorktreePath } from '@archon/git';
+
+import type {
+  IIsolationProvider,
+  IsolationResolution,
+  ResolvedIsolation,
+  IsolationHints,
+  IsolationEnvironmentRow,
+  IsolationWorkflowType,
+  IsolationRequest,
+  WorktreeStatusBreakdown,
+  ResolveRequest,
+} from './types';
+import {
+  WorktreeRegistrationChangedError,
+  sameWorktreeRegistration,
+  worktreeRegistrationMetadata,
+} from './types';
+import {
+  recordWorktreeAdoption,
+  registerWorktree,
+  removeCreatedWorktree,
+  type IIsolationStore,
+} from './store';
+import { classifyIsolationError, isKnownIsolationError } from './errors';
+import { resolveFolderBackend } from './backend-router';
+
+/** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('isolation.resolver');
+  return cachedLog;
+}
+
+/**
+ * Dependencies injected into the resolver.
+ * Keeps the resolver decoupled from DB and cleanup implementations.
+ */
+export interface IsolationResolverDeps {
+  store: IIsolationStore;
+  provider: IIsolationProvider;
+  cleanup?: {
+    makeRoom: (codebaseId: string, repoPath: string) => Promise<{ removedCount: number }>;
+    getBreakdown: (codebaseId: string, repoPath: string) => Promise<WorktreeStatusBreakdown>;
+  };
+  staleThresholdDays?: number;
+}
+
+const DEFAULT_STALE_THRESHOLD_DAYS = 14;
+
+async function resolveCanonicalPath(
+  codebase: NonNullable<ResolveRequest['codebase']>
+): Promise<RepoPath | Extract<IsolationResolution, { status: 'blocked' }>> {
+  try {
+    return await getCanonicalRepoPath(codebase.defaultCwd);
+  } catch (error) {
+    // A registered checkout backed by `--separate-git-dir` is already the
+    // authoritative path, but Git has no reverse pointer from its linked
+    // worktree metadata to a primary checkout. Git worktree operations are
+    // valid from that registered linked checkout, so retain it as the anchor.
+    if (error instanceof CanonicalRepoPathUnavailableError) {
+      return toRepoPath(codebase.defaultCwd);
+    } else {
+      const err = error instanceof Error ? error : new Error(String(error));
+      getLog().error(
+        {
+          err,
+          errorType: err.constructor.name,
+          codebaseId: codebase.id,
+          defaultCwd: codebase.defaultCwd,
+        },
+        'isolation.canonical_repo_path_resolution_failed'
+      );
+
+      if (!isKnownIsolationError(err)) {
+        throw err;
+      }
+
+      const userMessage = classifyIsolationError(err);
+      return {
+        status: 'blocked',
+        reason: 'creation_failed',
+        userMessage:
+          userMessage +
+          ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
+      };
+    }
+  }
+}
+
+type CreatedEnvironment = Awaited<ReturnType<IIsolationProvider['create']>>;
+
+function newIsolationRequest(
+  codebase: ResolveRequest['codebase'] & object,
+  workflowType: IsolationWorkflowType,
+  workflowId: string,
+  hints: IsolationHints | undefined,
+  canonicalPath: RepoPath
+): IsolationRequest {
+  const baseRequest = {
+    codebaseId: codebase.id,
+    codebaseName: codebase.name,
+    canonicalRepoPath: canonicalPath,
+    baseBranch: codebase.defaultBranch ?? undefined,
+    identifier: workflowId,
+  };
+  if (workflowType === 'pr') {
+    return {
+      ...baseRequest,
+      workflowType: 'pr' as const,
+      prBranch: hints?.prBranch ?? toBranchName(`pr-${workflowId}`),
+      prSha: hints?.prSha,
+      isForkPR: hints?.isForkPR ?? false,
+    };
+  }
+  if (workflowType === 'task') {
+    return { ...baseRequest, workflowType: 'task' as const, taskBranch: hints?.taskBranch };
+  }
+  return { ...baseRequest, workflowType };
+}
+
+/** Turn a known creation failure into a blocked resolution; rethrow any other error. */
+function blockedCreation(
+  error: unknown,
+  codebase: ResolveRequest['codebase'] & object
+): IsolationResolution {
+  const err = error instanceof Error ? error : new Error(String(error));
+
+  if (!isKnownIsolationError(err)) {
+    // Unknown errors (programming bugs, unexpected failures) should propagate
+    // so they appear in logs as crashes, not as silent "workspace blocked" messages.
+    throw err;
+  }
+
+  const userMessage = classifyIsolationError(err);
+  getLog().error(
+    {
+      err,
+      errorType: err.constructor.name,
+      codebaseId: codebase.id,
+      codebaseName: codebase.name,
+    },
+    'isolation_creation_failed'
+  );
+
+  return {
+    status: 'blocked',
+    reason: 'creation_failed',
+    userMessage:
+      userMessage +
+      ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
+  };
+}
+
+function creationMethod(
+  isolatedEnv: CreatedEnvironment,
+  canonicalPath: RepoPath
+): ResolvedIsolation['method'] {
+  if (isolatedEnv.metadata.provenance !== 'created') return { type: 'provider_adoption' };
+  return {
+    type: 'created',
+    creationId: isolatedEnv.metadata.creationId,
+    canonicalRepoPath: canonicalPath,
+    branchCreated: isolatedEnv.metadata.branchCreated,
+    ...(isolatedEnv.metadata.cutFromCommit !== undefined
+      ? { cutFromCommit: isolatedEnv.metadata.cutFromCommit }
+      : {}),
+  };
+}
+
+/**
+ * Resolves which isolation environment to use for a conversation.
+ *
+ * Resolution order:
+ * 1. Existing environment reference (from conversation)
+ * 2. No codebase = skip isolation
+ * 3. Workflow reuse (same codebase + workflow identity)
+ * 4. Linked issue sharing (cross-conversation)
+ * 5. PR branch adoption (skill symbiosis)
+ * 6. Create new worktree
+ */
+export class IsolationResolver {
+  private readonly store: IIsolationStore;
+  private readonly provider: IIsolationProvider;
+  private readonly staleThresholdDays: number;
+
+  constructor(deps: IsolationResolverDeps) {
+    this.store = deps.store;
+    this.provider = deps.provider;
+    this.staleThresholdDays = deps.staleThresholdDays ?? DEFAULT_STALE_THRESHOLD_DAYS;
+
+    if (this.staleThresholdDays <= 0) {
+      throw new Error(
+        `staleThresholdDays must be positive, got ${String(this.staleThresholdDays)}`
+      );
+    }
+  }
+
+  /**
+   * Resolve isolation for a conversation request.
+   */
+  async resolve(request: ResolveRequest): Promise<IsolationResolution> {
+    const baseBranch = request.hints?.baseBranch;
+
+    // 1. Check existing isolation reference
+    if (request.existingEnvId) {
+      return this.resolveExisting(request.existingEnvId, request.codebase?.defaultCwd, baseBranch);
+    }
+
+    // 2. No codebase = no isolation
+    if (!request.codebase) {
+      return { status: 'none', cwd: '/workspace' };
+    }
+
+    // 2b. Folder projects run through the folder-backend seam — no worktree.
+    // The in-place backend (Phase A default) returns the REAL folder path (not
+    // the '/workspace' docker sentinel), so chat/workflows land in the actual
+    // project directory — byte-identical to the pre-seam early-return. Container
+    // selection is a Phase B config concern; the chat path stays in-place for now.
+    //
+    // NOTE (Phase A): only `prepared.cwd` is propagated. `prepared.execContext`
+    // is intentionally DROPPED here because the `IsolationResolution` 'none'
+    // variant carries no execution-context field, so chat/orchestrator callers
+    // (which consume this result) have no channel for it — they run host-only in
+    // Phase A. Phase B, when it wires containerized CHAT, must extend the 'none'
+    // variant with an `execContext` and thread it through the orchestrator; until
+    // then only the CLI workflow path carries execContext (from the backend it
+    // resolves directly).
+    if (request.codebase.kind === 'folder') {
+      const folderCodebase = {
+        id: request.codebase.id,
+        defaultCwd: request.codebase.defaultCwd,
+        name: request.codebase.name,
+        kind: 'folder' as const,
+      };
+      const backend = resolveFolderBackend(folderCodebase, { container: false });
+      const prepared = await backend.prepare({ codebase: folderCodebase });
+      return { status: 'none', cwd: prepared.cwd };
+    }
+
+    const codebase = request.codebase;
+    const hints = request.hints;
+    const workflowType: IsolationWorkflowType = hints?.workflowType ?? 'thread';
+    const workflowId = hints?.workflowId ?? '';
+
+    const canonicalPath = await resolveCanonicalPath(codebase);
+    if (typeof canonicalPath !== 'string') return canonicalPath;
+
+    // 3. Check for existing environment with same workflow
+    const reusable = await this.findReusable(
+      codebase.id,
+      canonicalPath,
+      workflowType,
+      workflowId,
+      baseBranch
+    );
+    if (reusable) {
+      return {
+        status: 'resolved',
+        env: reusable.env,
+        cwd: reusable.env.working_path,
+        method: { type: 'workflow_reuse' },
+        ...(reusable.warnings.length > 0 ? { warnings: reusable.warnings } : {}),
+      };
+    }
+
+    // 4. Check linked issues for sharing
+    if (hints?.linkedIssues?.length) {
+      const linked = await this.findLinkedIssueEnv(codebase.id, canonicalPath, hints.linkedIssues);
+      if (linked) return linked;
+    }
+
+    // 5. Try PR branch adoption
+    if (hints?.prBranch) {
+      const adopted = await this.tryBranchAdoption(
+        codebase,
+        canonicalPath,
+        hints,
+        workflowType,
+        workflowId,
+        request.platformType,
+        request.userId
+      );
+      if (adopted) return adopted;
+    }
+
+    // 6. Create new environment
+    return this.createNewEnvironment(
+      codebase,
+      workflowType,
+      workflowId,
+      hints,
+      canonicalPath,
+      request.platformType,
+      request.userId,
+      request.setupExecutor
+    );
+  }
+
+  private async resolveExisting(
+    envId: string,
+    defaultCwd: string | undefined,
+    baseBranch: BranchName | undefined
+  ): Promise<IsolationResolution> {
+    const existing = await this.checkExisting(envId, defaultCwd, baseBranch);
+    return existing ?? { status: 'stale_cleaned', previousEnvId: envId };
+  }
+
+  /**
+   * Validate that the worktree is based on the expected base branch.
+   * Returns a warning string if mismatched, empty array otherwise.
+   * Never throws — validation errors are non-blocking.
+   */
+  private async collectBaseBranchWarnings(
+    env: IsolationEnvironmentRow,
+    baseBranch: BranchName | undefined,
+    logContext: Record<string, unknown>
+  ): Promise<string[]> {
+    if (!baseBranch) return [];
+    try {
+      const isValid = await isAncestorOf(toWorktreePath(env.working_path), `origin/${baseBranch}`);
+      if (!isValid) {
+        getLog().warn(
+          { ...logContext, branchName: env.branch_name, baseBranch },
+          'isolation.reuse_base_branch_mismatch'
+        );
+        return [
+          `Worktree branch '${env.branch_name}' is not based on '${baseBranch}'. ` +
+            `Recreate with: archon complete ${env.branch_name} --force`,
+        ];
+      }
+    } catch (err) {
+      getLog().warn(
+        { err, ...logContext, branchName: env.branch_name, baseBranch },
+        'isolation.reuse_base_branch_check_failed'
+      );
+    }
+    return [];
+  }
+
+  /**
+   * Check if an existing environment reference is still valid.
+   */
+  private async checkExisting(
+    envId: string,
+    repoPath: string | undefined,
+    baseBranch?: BranchName
+  ): Promise<IsolationResolution | null> {
+    const env = await this.store.getById(envId);
+    if (env) this.assertWorktreeEnvironment(env);
+    if (env && (await worktreeExists(toWorktreePath(env.working_path)))) {
+      let adopted = env;
+      if (env.provider === 'worktree') {
+        if (!repoPath) throw new Error('Cannot reuse isolation without a codebase repository');
+        adopted = await recordWorktreeAdoption(this.store, env, repoPath);
+      }
+      const warnings = await this.collectBaseBranchWarnings(env, baseBranch, { envId });
+      return {
+        status: 'resolved',
+        env: adopted,
+        cwd: env.working_path,
+        method: { type: 'existing' },
+        ...(warnings.length > 0 ? { warnings } : {}),
+      };
+    }
+
+    if (env?.status === 'active') {
+      await this.markDestroyedBestEffort(env);
+    }
+
+    return null;
+  }
+
+  /**
+   * Verify that an on-disk worktree belongs to the expected repo before
+   * adopting. Wraps the shared `verifyWorktreeOwnership` with logging that
+   * includes structured fields for incident debugging — the error message
+   * alone is not enough because stack traces and call sites vary.
+   *
+   * Throws on mismatch (re-throws the original error so `classifyIsolationError`
+   * and `isKnownIsolationError` retain its typed cause).
+   */
+  private async assertWorktreeOwnership(
+    worktreePath: WorktreePath,
+    canonicalRepoPath: RepoPath,
+    logContext: Record<string, unknown>,
+    logEvent: string
+  ): Promise<void> {
+    try {
+      await verifyWorktreeOwnership(worktreePath, canonicalRepoPath);
+    } catch (err) {
+      getLog().warn(
+        { ...logContext, worktreePath, canonicalRepoPath, err: (err as Error).message },
+        logEvent
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * Find a reusable environment by workflow identity.
+   *
+   * Verifies that the on-disk worktree belongs to `canonicalRepoPath` before
+   * returning. On cross-clone mismatch, throws — the DB row belongs to the
+   * other clone and we must not adopt it. The other clone's row is preserved
+   * (no markDestroyed) so the other clone's work continues.
+   */
+  private async findReusable(
+    codebaseId: string,
+    canonicalRepoPath: RepoPath,
+    workflowType: IsolationWorkflowType,
+    workflowId: string,
+    baseBranch?: BranchName
+  ): Promise<{ env: IsolationEnvironmentRow; warnings: string[] } | null> {
+    const existing = await this.store.findActiveByWorkflow(codebaseId, workflowType, workflowId);
+    if (!existing) return null;
+    this.assertWorktreeEnvironment(existing);
+
+    const worktreePath = toWorktreePath(existing.working_path);
+    if (await worktreeExists(worktreePath)) {
+      const adopted = await recordWorktreeAdoption(this.store, existing, canonicalRepoPath);
+
+      getLog().debug({ workflowType, workflowId }, 'isolation_reuse_existing');
+      const warnings = await this.collectBaseBranchWarnings(existing, baseBranch, {
+        workflowType,
+        workflowId,
+      });
+      return { env: adopted, warnings };
+    }
+
+    await this.markDestroyedBestEffort(existing);
+    return null;
+  }
+
+  /**
+   * Find an environment linked to one of the given issue numbers.
+   *
+   * Verifies each candidate worktree belongs to `canonicalRepoPath` before
+   * adopting. On cross-clone mismatch, throws — this stops iteration over any
+   * remaining linked issues. Intentional: if a linked env is owned by another
+   * clone, the user's machine state is anomalous (two clones of the same
+   * remote) and they should resolve it explicitly rather than have us skip
+   * past the signal. For the 99% single-clone case, this path always succeeds.
+   */
+  private async findLinkedIssueEnv(
+    codebaseId: string,
+    canonicalRepoPath: RepoPath,
+    linkedIssues: number[]
+  ): Promise<IsolationResolution | null> {
+    for (const issueNum of linkedIssues) {
+      const linkedEnv = await this.store.findActiveByWorkflow(
+        codebaseId,
+        'issue',
+        String(issueNum)
+      );
+      if (!linkedEnv) continue;
+      this.assertWorktreeEnvironment(linkedEnv);
+
+      const worktreePath = toWorktreePath(linkedEnv.working_path);
+      if (await worktreeExists(worktreePath)) {
+        const adopted = await recordWorktreeAdoption(this.store, linkedEnv, canonicalRepoPath);
+
+        getLog().debug({ issueNum, codebaseId }, 'isolation_share_linked_issue');
+        return {
+          status: 'resolved',
+          env: adopted,
+          cwd: linkedEnv.working_path,
+          method: { type: 'linked_issue_reuse', issueNumber: issueNum },
+        };
+      }
+
+      await this.markDestroyedBestEffort(linkedEnv);
+    }
+    return null;
+  }
+
+  /**
+   * Try adopting an existing worktree matching a PR branch.
+   *
+   * Verifies ownership of the discovered worktree before recording it in the
+   * DB. On cross-clone mismatch, throws — adopting another clone's worktree
+   * would create a stale DB row pointing at someone else's filesystem state.
+   */
+  private async tryBranchAdoption(
+    codebase: ResolveRequest['codebase'] & object,
+    canonicalRepoPath: RepoPath,
+    hints: IsolationHints,
+    workflowType: IsolationWorkflowType,
+    workflowId: string,
+    platformType: string,
+    userId: string | undefined
+  ): Promise<IsolationResolution | null> {
+    const prBranch = hints.prBranch;
+    if (!prBranch) return null;
+
+    const adoptedPath = await findWorktreeByBranch(canonicalRepoPath, prBranch);
+    if (adoptedPath && (await worktreeExists(adoptedPath))) {
+      await this.assertWorktreeOwnership(
+        adoptedPath,
+        canonicalRepoPath,
+        { codebaseId: codebase.id, prBranch },
+        'isolation.branch_adoption_refused_cross_checkout'
+      );
+
+      getLog().warn({ adoptedPath, prBranch }, 'isolation_worktree_adopted');
+      const env = await this.store.create({
+        codebase_id: codebase.id,
+        workflow_type: workflowType,
+        workflow_id: workflowId,
+        working_path: adoptedPath,
+        branch_name: prBranch,
+        created_by_platform: platformType,
+        created_by_user_id: userId,
+        metadata: {
+          ...worktreeRegistrationMetadata({ provenance: 'adopted', adopted: true }),
+          adopted_from: 'skill',
+        },
+      });
+      return {
+        status: 'resolved',
+        env,
+        cwd: adoptedPath,
+        method: { type: 'branch_adoption', branch: prBranch },
+      };
+    }
+    return null;
+  }
+
+  private assertWorktreeEnvironment(env: IsolationEnvironmentRow): void {
+    if (env.provider !== 'worktree') {
+      throw new Error(
+        `Environment ${env.id} is not a worktree. Use archon isolation cleanup 0 for container cleanup.`
+      );
+    }
+  }
+
+  /**
+   * Best-effort retire the observed registration of a worktree whose path is gone.
+   * Registration conflicts must stop resolution before it clears or replaces live state.
+   */
+  private async markDestroyedBestEffort(env: IsolationEnvironmentRow): Promise<void> {
+    try {
+      await this.store.markWorktreeDestroyed(env);
+    } catch (cleanupError) {
+      if (cleanupError instanceof WorktreeRegistrationChangedError) throw cleanupError;
+      const err = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+      getLog().error(
+        { err, errorType: err.constructor.name, isolationEnvId: env.id },
+        'isolation_cleanup_failed'
+      );
+    }
+  }
+
+  /**
+   * Create a new isolation environment.
+   */
+  private async createNewEnvironment(
+    codebase: ResolveRequest['codebase'] & object,
+    workflowType: IsolationWorkflowType,
+    workflowId: string,
+    hints: IsolationHints | undefined,
+    canonicalPath: RepoPath,
+    platformType: string,
+    userId: string | undefined,
+    setupExecutor?: WorktreeSetupExecutor
+  ): Promise<IsolationResolution> {
+    const isolationRequest = newIsolationRequest(
+      codebase,
+      workflowType,
+      workflowId,
+      hints,
+      canonicalPath
+    );
+
+    const registrationsBeforeCreation = await this.store.listActive();
+    let isolatedEnv: CreatedEnvironment;
+    try {
+      isolatedEnv = await this.provider.create(isolationRequest, setupExecutor);
+    } catch (error) {
+      return blockedCreation(error, codebase);
+    }
+
+    const env = await registerWorktree(
+      { store: this.store, provider: this.provider, registrationsBeforeCreation },
+      isolatedEnv,
+      canonicalPath,
+      {
+        codebase_id: codebase.id,
+        workflow_type: workflowType,
+        workflow_id: workflowId,
+        created_by_platform: platformType,
+        created_by_user_id: userId,
+        metadata: {
+          related_issues: hints?.linkedIssues ?? [],
+          related_prs: hints?.linkedPRs ?? [],
+        },
+      }
+    );
+
+    return {
+      status: 'resolved',
+      env,
+      cwd: env.working_path,
+      method: creationMethod(isolatedEnv, canonicalPath),
+      ...(isolatedEnv.warnings?.length ? { warnings: isolatedEnv.warnings } : {}),
+    };
+  }
+
+  /**
+   * Undo a resolution the caller could not link to its conversation. Only a
+   * worktree this resolution created is removed; reused and adopted environments
+   * may be in use elsewhere and are left exactly as they were. The row is marked
+   * destroyed only after removal is verified, so a failed removal stays active
+   * for cleanup to retry. Never throws, so the caller can rethrow its link error.
+   */
+  async releaseUnlinked(resolution: ResolvedIsolation): Promise<void> {
+    const { env, method } = resolution;
+    if (method.type !== 'created') return;
+
+    try {
+      const active = await this.store.listActive();
+      if (
+        active.some(
+          row =>
+            isSameWorktreePath(row.working_path, env.working_path) &&
+            !sameWorktreeRegistration(row, env)
+        )
+      ) {
+        getLog().warn(
+          { isolationEnvId: env.id, worktreePath: env.working_path },
+          'isolation_rollback_skipped_registered'
+        );
+        return;
+      }
+    } catch (error) {
+      getLog().error(
+        { err: error instanceof Error ? error : new Error(String(error)), isolationEnvId: env.id },
+        'isolation_rollback_failed'
+      );
+      return;
+    }
+    try {
+      await this.store.withWorktreeRegistration(env, async markDestroyed => {
+        const removed = await removeCreatedWorktree(this.provider, env.working_path, {
+          canonicalRepoPath: method.canonicalRepoPath,
+          creationId: method.creationId,
+          ...(method.branchCreated ? { branchName: toBranchName(env.branch_name) } : {}),
+        });
+        if (removed) await markDestroyed();
+      });
+    } catch (error) {
+      getLog().error(
+        { err: error instanceof Error ? error : new Error(String(error)), isolationEnvId: env.id },
+        'isolation_rollback_failed'
+      );
+    }
+  }
+}

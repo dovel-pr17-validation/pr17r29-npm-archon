@@ -1,0 +1,222 @@
+# Adapter Implementation Guide
+
+> **Purpose**: Reference for maintaining existing bundled platform adapters.
+> **When to use**: Debugging bundled adapter behavior and understanding cross-platform message flow.
+
+New chat platforms ship as plugins in contributor-owned repositories using `ChatPlugin` from `@archon/chat-contract`. Follow the [chat plugin publishing guide](../../packages/docs-web/src/content/docs/guides/publishing-plugins.md#chat-plugins) and the [chat contract](../../packages/chat-contract/README.md). New forges use the [forge plugin publishing guide](../../packages/docs-web/src/content/docs/guides/publishing-plugins.md#tags-and-executable-release-assets). Do not add a bundled adapter or register a new platform in the server.
+
+---
+
+## The Interface: `IPlatformAdapter`
+
+Defined at `packages/core/src/types/index.ts` — search for `export interface IPlatformAdapter`.
+
+| Method | Signature | Required |
+|--------|-----------|----------|
+| `capabilities` | `{ messagePersistence: 'core' \| 'adapter'; defaultWorkflowDispatch: 'foreground' \| 'background' }` (readonly property) | Yes |
+| `sendMessage` | `(conversationId: string, message: string, metadata?: MessageMetadata): Promise<void>` | Yes |
+| `ensureThread` | `(originalConversationId: string, messageContext?: unknown): Promise<string>` | Yes |
+| `getStreamingMode` | `(): 'stream' \| 'batch'` | Yes |
+| `getPlatformType` | `(): string` | Yes |
+| `start` | `(): Promise<void>` | Yes |
+| `stop` | `(): void` | Yes |
+| `sendStructuredEvent` | `(conversationId: string, event: MessageChunk): Promise<void>` | Optional |
+| `emitRetract` | `(conversationId: string): Promise<void>` | Optional |
+| `prepareBackgroundConversation` | `(context: { workerConversationId; parentConversationId; conversationDbId }): Promise<() => Promise<void>>` — runs before a background worker starts; core awaits the returned finalizer when dispatch setup or the worker ends | Optional |
+
+`WebAdapter` (`packages/server/src/adapters/web.ts`) adds web-only methods such as `setConversationDbId` and `emitLockEvent`. The server holds the concrete `WebAdapter` and calls them directly; core sees only `IPlatformAdapter`.
+
+---
+
+## Common Template (All Adapters Share)
+
+### 1. Lazy Logger Pattern
+
+Every adapter file uses this at module scope:
+
+```typescript
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('adapter.<name>');
+  return cachedLog;
+}
+```
+
+Never initialize the logger at module scope — test mocks must intercept `createLogger` before first use.
+
+### 2. Auth: Constructor Whitelist + Silent Rejection
+
+Every adapter reads its env var in the constructor and stores the parsed whitelist:
+
+| Adapter | Env Var | ID Type | Auth File |
+|---------|---------|---------|-----------|
+| Slack | `SLACK_ALLOWED_USER_IDS` | descriptor `allowlist`, enforced by the chat host | `packages/chat-slack/src/descriptor.ts` |
+| Telegram | `TELEGRAM_ALLOWED_USER_IDS` | `number[]` (positive integers) | `chat/telegram/auth.ts` |
+| GitHub | `GITHUB_ALLOWED_USERS` | `string[]` (lowercase normalized) | `forge/github/auth.ts` |
+| Discord | `DISCORD_ALLOWED_USER_IDS` | `string[]` (numeric snowflakes) | `community/chat/discord/auth.ts` |
+
+Each auth module exports `parseAllowedXxx(envValue)` and `isXxxAuthorized(userId, allowedIds)`. Empty whitelist = open access. On failure: log with `userId.slice(0, 4) + '***'` masking, then `return` silently (no error sent to user).
+
+### 3. Message Handler Registration
+
+```typescript
+// In adapter class
+onMessage(handler: MessageHandler): void {
+  this.messageHandler = handler;
+}
+
+// In start() — fire-and-forget
+void this.messageHandler(event);
+```
+
+### 4. Message Splitting
+
+Bundled adapters use `splitIntoParagraphChunks(message, maxLength)` from `packages/adapters/src/utils/message-splitting.ts`:
+
+| Platform | Limit | Buffer | Effective Split At |
+|----------|-------|--------|-------------------|
+| Telegram | 4,096 | 200 | 3,896 |
+| GitHub | 65,000 | 500 | 64,500 |
+| Discord | 2,000 | 100 | 1,900 |
+
+Two-pass algorithm: split on `\n\n+` first, then `\n` for oversized paragraphs.
+
+### 5. `ensureThread()` is Usually a No-op
+
+Only Discord creates real threads. Telegram and GitHub have no thread concept (or use inherent threading).
+
+---
+
+## Per-Adapter Deep Dive
+
+### Slack (chat plugin)
+
+Slack is not a bundled adapter. It ships as the `@archon/chat-slack` chat plugin (`packages/chat-slack/`), which the server hosts through `@archon/chat-contract`. Its allowlist row above points at its descriptor; see `guides/publishing-plugins.md#chat-plugins` for the contract.
+
+---
+
+### Telegram (`TelegramAdapter`)
+
+**File:** `packages/adapters/src/chat/telegram/adapter.ts`
+
+**Receiving:** Long polling via Telegraf `bot.launch()`. Constructor sets `handlerTimeout: Infinity` (line 31) to avoid 90s timeout on long AI operations. Launches with `dropPendingUpdates: true` to discard offline messages.
+
+**Conversation ID:** Numeric chat ID as string (`ctx.chat.id.toString()`).
+
+**Sending:** Two-stage markdown: converts to MarkdownV2 via `convertToTelegramMarkdown()`, sends with `parse_mode: 'MarkdownV2'`, falls back to `stripMarkdown()` on rejection. Helper functions in `chat/telegram/markdown.ts`.
+
+**Streaming mode:** `'stream'` by default, overridden via `TELEGRAM_STREAMING_MODE`.
+
+**Unique:**
+- Auth IDs are `number[]` (Telegram user IDs are numeric)
+- `handlerTimeout: Infinity` for long-running AI operations
+- `dropPendingUpdates: true` on launch
+
+---
+
+### GitHub (`GitHubAdapter`)
+
+**File:** `packages/adapters/src/forge/github/adapter.ts`, which delegates to `webhook-intake.ts`, `check-run-signal.ts`, `registration.ts`, `repository-readiness.ts` and `comment-delivery.ts` in the same folder.
+
+**Receiving:** Webhooks. `start()` is a no-op. Server registers `POST /webhooks/github` which calls `receiveWebhook()`; conversational events run `handleWebhook()` in the background.
+
+**Webhook processing flow (`handleWebhook()`):**
+1. HMAC-SHA256 signature verification
+2. Auth check against `GITHUB_ALLOWED_USERS` (username from `event.sender.login`)
+3. `parseWebhookEvent()` extracts fields — **only handles `issue_comment.created`, `issues.closed`, `pull_request.closed`** — NOT `issues.opened` or `pull_request.opened` (descriptions contain docs, not commands; see #96)
+4. Self-loop prevention: ignores comments containing `<!-- archon-bot-response -->`
+5. Bot mention check via `hasMention()`
+6. `getOrCreateCodebaseForRepo()` upserts codebase record
+7. `ensureRepoReady()` clones (new) or syncs (existing) the repository
+8. Builds `IsolationHints` for PR/issue workflows
+
+**Conversation ID:** `owner/repo#number` (e.g., `acme/api#42`).
+
+**Sending:** `octokit.rest.issues.createComment` with retry logic (3 attempts, exponential backoff). Appends `<!-- archon-bot-response -->` marker to every comment.
+
+**Streaming mode:** Always `'batch'` (hardcoded).
+
+**Unique:**
+- Only adapter with its own `ConversationLockManager` (injected in constructor)
+- Only adapter that calls `handleMessage()` directly (not via server.ts)
+- Has `ensureRepoReady()` for on-demand repo clone/sync
+- Builds `IsolationHints` with PR branch, SHA, fork detection
+
+---
+
+### Discord (`DiscordAdapter`)
+
+**File:** `packages/adapters/src/community/chat/discord/adapter.ts`
+
+**Receiving:** discord.js WebSocket via `client.login()`. Gateway intents: `Guilds`, `GuildMessages`, `MessageContent`, `DirectMessages`. `Partials.Channel` required for DM support. Registers `Events.MessageCreate` listener in `start()`.
+
+**Conversation ID:** Channel ID string (Discord snowflake). Thread messages use the thread's own channel ID, so each thread is a separate conversation automatically.
+
+**`ensureThread()` — The only adapter with real implementation (line 195):**
+1. If already in a thread → return thread's `channelId`
+2. If in a DM → no threading, return unchanged
+3. Deduplication: checks `this.pendingThreads` map to prevent double creation
+4. Creates thread via `message.startThread()` with `autoArchiveDuration: OneDay`
+5. Thread name: first 97 chars of message content, fallback `'Bot Response'`
+
+**Streaming mode:** `'stream'` by default, overridden via `DISCORD_STREAMING_MODE`.
+
+**Unique:**
+- Real thread creation with deduplication map
+- `isBotMentioned(message)` checks `message.mentions.has(botUser)`
+- 2,000-char message limit (smallest of all platforms)
+
+---
+
+### Web (`WebAdapter`)
+
+**File:** `packages/server/src/adapters/web.ts`
+
+**Receiving:** None — purely output-driven. Messages arrive via REST API (`POST /api/conversations/:id/message`). The adapter's job is SSE streaming + message persistence.
+
+**Architecture:** Facade over three injected components:
+- `SSETransport` (`web/transport.ts`): manages `Map<string, SSEWriter>` of active connections
+- `MessagePersistence` (`web/persistence.ts`): buffers text + tool calls, flushes to DB
+- `WorkflowEventBridge` (`web/workflow-bridge.ts`): forwards workflow events from workers to parent SSE
+
+**`sendMessage()` (line 44):**
+1. Calls `persistence.appendText()` first (always buffer for DB)
+2. Skips SSE for `tool_call_formatted` and `isolation_context` categories
+3. Emits `{ type: 'text', content, isComplete: true }` via `SSETransport.emit()`
+4. Forces immediate `persistence.flush()` for `workflow_result` category
+
+**`sendStructuredEvent()` (line 81):** Handles `'tool'`, `'result'` (session info), `'workflow_dispatch'` message chunks.
+
+**`emitRetract()` (line 212):** Removes last buffered segment from persistence, emits `{ type: 'retract' }` over SSE.
+
+**Streaming mode:** Always `'stream'` (hardcoded).
+
+**Unique:**
+- No auth (single-developer tool on local machine)
+- No polling/WebSocket — output-only
+- Message persistence layer (other adapters don't persist)
+- `emitLockEvent()` for UI lock indicators
+- `SSETransport.scheduleCleanup()` with `RECONNECT_GRACE_MS = 5000ms`
+
+---
+
+## How Adapters Are Registered (`server/src/index.ts`)
+
+```
+1. Check env var: Boolean(process.env.XYZ_BOT_TOKEN)
+2. Instantiate: new XyzAdapter(token, streamingMode)
+3. Register handler: adapter.onMessage(async event => {
+     conversationId = getConversationId(event)
+     conversationId = await ensureThread(conversationId, event)
+     history = await fetchThreadHistory(event)  // optional
+     await lockManager.acquireLock(conversationId, async () => {
+       await handleMessage(adapter, conversationId, content, context)
+     })
+   })
+4. Start: await adapter.start()
+```
+
+GitHub is different — self-contained, handles its own lock acquisition internally.
+Web is always enabled (not conditional on env vars).
+
+---

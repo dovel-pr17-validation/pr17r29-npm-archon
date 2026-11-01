@@ -1,0 +1,8 @@
+# Bun configuration for Remote Agentic Coding Platform
+
+[test]
+# Only discover tests in packages/ - prevents finding duplicates in workspace/worktrees
+root = "./packages"
+# Tests get a scratch ARCHON_HOME and no telemetry (scripts/test-preload.ts)
+preload = ["./scripts/test-preload.ts"]
+coverageDir = "coverage"

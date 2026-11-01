@@ -1,0 +1,821 @@
+// @archon-test-isolated
+import { validateStructuredOutput } from './structured-output';
+import { readSubrunMetadata } from './schemas/workflow-run';
+import { describe, it, expect } from 'bun:test';
+
+import {
+  assertProducerNotFailed,
+  assertSupportedOutputRefs,
+  CURRENT_OUTPUT_PATH_SOURCE,
+  PRIOR_OUTPUT_PATH_SOURCE,
+  canonicalValueText,
+  declaredFieldsFromSchema,
+  declaredOutputPathsFromSchema,
+  assertDeclaredOutputPath,
+  jsonValueSchema,
+  inputRefToken,
+  OutputRefError,
+  parseWholeInputsRef,
+  parseWholeOutputRef,
+  resolveNodeOutputField,
+  resolveInputValue,
+  similarNodeIds,
+  substituteTemplate,
+} from './output-ref';
+import { buildTruncationMarker, hasTruncationMarker } from './utils/output-truncation';
+import type { NodeOutput } from './schemas';
+
+/** Resolve with the canonical reference text, as a `$node.output.field` template would. */
+function resolveField(node: NodeOutput, nodeId: string, field: string) {
+  return resolveNodeOutputField(node, nodeId, field, `$${nodeId}.output.${field}`);
+}
+
+function completed(
+  output: string,
+  structuredOutput?: unknown,
+  declaredFields?: string[]
+): NodeOutput {
+  return {
+    state: 'completed',
+    output,
+    ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+    ...(declaredFields !== undefined
+      ? { declaredOutputPaths: declaredFields.map(field => [field]) }
+      : {}),
+  };
+}
+
+// #2637 — THE deterministic value→text rule: strings raw, everything else canonical
+// JSON. Pinned per JSON type so any drift from the pre-extraction inline mappings
+// (String(number|boolean), JSON.stringify(array|object|null)) fails here first.
+describe('canonicalValueText', () => {
+  it('passes strings through raw (never quoted)', () => {
+    expect(canonicalValueText('hello world')).toBe('hello world');
+    expect(canonicalValueText('')).toBe('');
+    expect(canonicalValueText('{"already":"json"}')).toBe('{"already":"json"}');
+  });
+
+  it('maps numbers and booleans to their JSON text (identical to String())', () => {
+    expect(canonicalValueText(42)).toBe('42');
+    expect(canonicalValueText(-1.5)).toBe('-1.5');
+    expect(canonicalValueText(true)).toBe('true');
+    expect(canonicalValueText(false)).toBe('false');
+  });
+
+  it('maps null, arrays, and objects to canonical JSON text', () => {
+    expect(canonicalValueText(null)).toBe('null');
+    expect(canonicalValueText([1, 'a', null])).toBe('[1,"a",null]');
+    expect(canonicalValueText({ b: 1, a: [true] })).toBe('{"b":1,"a":[true]}');
+  });
+
+  it("defensively maps JSON-unrepresentable values to '' (unreachable from parsed JSON)", () => {
+    expect(canonicalValueText(undefined)).toBe('');
+    expect(canonicalValueText(Symbol('x'))).toBe('');
+  });
+});
+
+describe('jsonValueSchema', () => {
+  it('accepts every JSON value shape and rejects undefined', () => {
+    for (const value of ['s', 0, -2.5, true, false, null, [1, 'a'], { k: { n: null } }]) {
+      expect(jsonValueSchema.safeParse(value).success).toBe(true);
+    }
+    expect(jsonValueSchema.safeParse(undefined).success).toBe(false);
+    expect(jsonValueSchema.safeParse(new Date()).success).toBe(false);
+  });
+});
+
+describe('parseWholeOutputRef', () => {
+  it('parses a whole unfielded and fielded ref, tolerating surrounding whitespace', () => {
+    expect(parseWholeOutputRef('$plan.output')).toEqual({ nodeId: 'plan' });
+    expect(parseWholeOutputRef('  $plan.output.items ')).toEqual({
+      nodeId: 'plan',
+      field: 'items',
+    });
+  });
+
+  it('returns undefined for templates, prose, and non-refs', () => {
+    expect(parseWholeOutputRef('before $plan.output')).toBeUndefined();
+    expect(parseWholeOutputRef('$plan.output and after')).toBeUndefined();
+    expect(parseWholeOutputRef('$INPUTS.name')).toBeUndefined();
+    expect(parseWholeOutputRef('literal')).toBeUndefined();
+    expect(parseWholeOutputRef('')).toBeUndefined();
+  });
+});
+
+describe('output reference token boundaries', () => {
+  it('leaves input macros with output-prefixed names to the input resolver', () => {
+    expect(() => assertSupportedOutputRefs('$INPUTS.outputMode')).not.toThrow();
+  });
+  for (const [prefix, source] of [
+    ['$review', CURRENT_OUTPUT_PATH_SOURCE],
+    ['$LOOP_PREV.review', PRIOR_OUTPUT_PATH_SOURCE],
+  ] as const) {
+    it(`rejects unsupported ${prefix} syntax before any prefix is substituted`, () => {
+      for (const suffix of ['[0]', '.*', '..action', '.0', '?.action']) {
+        const reference = `${prefix}.output.proposal.action${suffix}`;
+        expect(() => assertSupportedOutputRefs(reference)).toThrow(reference);
+      }
+    });
+
+    it(`preserves punctuation and literal suffixes around ${prefix} paths`, () => {
+      const reference = `${prefix}.output.proposal.action`;
+      for (const suffix of [
+        '.',
+        ', next',
+        '!',
+        '?',
+        '**',
+        '(value)',
+        '+1',
+        '-suffix',
+        '/file',
+        '-$INPUTS.item',
+      ]) {
+        const template = `${reference}${suffix}`;
+        expect(() => assertSupportedOutputRefs(template)).not.toThrow();
+        expect(new RegExp(source, 'g').exec(template)?.[0]).toBe(reference);
+      }
+    });
+
+    it(`treats any text after a whole ${prefix} output as literal`, () => {
+      for (const suffix of ['[0]', '.*', '..', '.5', '(see)', '+1', '?.x']) {
+        expect(() => assertSupportedOutputRefs(`${prefix}.output${suffix}`)).not.toThrow();
+      }
+    });
+  }
+});
+
+describe('parseWholeInputsRef', () => {
+  it('parses a whole $INPUTS.<name> ref to its name, tolerating whitespace', () => {
+    expect(parseWholeInputsRef('$INPUTS.mode')).toBe('mode');
+    expect(parseWholeInputsRef('  $INPUTS.foo-bar ')).toBe('foo-bar');
+  });
+
+  it('returns undefined for templates, output refs, and non-refs', () => {
+    expect(parseWholeInputsRef('v=$INPUTS.mode')).toBeUndefined();
+    expect(parseWholeInputsRef('$INPUTS.mode!')).toBeUndefined();
+    expect(parseWholeInputsRef('$plan.output')).toBeUndefined();
+    expect(parseWholeInputsRef('literal')).toBeUndefined();
+    expect(parseWholeInputsRef('')).toBeUndefined();
+  });
+});
+
+describe('input value and template resolution', () => {
+  it('preserves logical values and converts only template replacements to text', () => {
+    const inputs = {
+      text: '$INPUTS.other',
+      empty: '',
+      count: 0,
+      flag: false,
+      absent: null,
+      items: [1, 'two'],
+      object: { nested: true },
+    };
+    for (const [name, value] of Object.entries(inputs)) {
+      expect(resolveInputValue(name, inputs)).toBe(value);
+      expect(substituteTemplate(`value=$INPUTS.${name}`, [inputRefToken(inputs)])).toBe(
+        `value=${typeof value === 'string' ? value : JSON.stringify(value)}`
+      );
+    }
+  });
+
+  it('keeps the same unknown-input errors on logical and text surfaces', () => {
+    for (const [name, inputs, suffix] of [
+      ['pln', { plan: 'x' }, ' Did you mean $INPUTS.plan?'],
+      ['xyzzy', { plan: 'x' }, ' Available inputs: $INPUTS.plan.'],
+      ['toString', {}, ' This run has no declared inputs.'],
+      ['missing', undefined, ' This run has no declared inputs.'],
+    ] as const) {
+      const error = new Error(`Unknown input '$INPUTS.${name}'.${suffix}`);
+      expect(() => resolveInputValue(name, inputs)).toThrow(error);
+      expect(() => substituteTemplate(`$INPUTS.${name}`, [inputRefToken(inputs)])).toThrow(error);
+    }
+  });
+});
+
+describe('declaredFieldsFromSchema', () => {
+  it('returns the property names for an object schema', () => {
+    expect(declaredFieldsFromSchema({ type: 'object', properties: { a: {}, b: {} } })).toEqual([
+      'a',
+      'b',
+    ]);
+  });
+
+  it('returns [] for an explicit empty properties map', () => {
+    expect(declaredFieldsFromSchema({ type: 'object', properties: {} })).toEqual([]);
+  });
+
+  it('returns undefined when there is no schema', () => {
+    expect(declaredFieldsFromSchema(undefined)).toBeUndefined();
+  });
+
+  it('returns undefined for a non-object schema (no properties map)', () => {
+    expect(declaredFieldsFromSchema({ type: 'array', items: {} })).toBeUndefined();
+    expect(declaredFieldsFromSchema({ type: 'string' })).toBeUndefined();
+  });
+
+  it('returns undefined when properties is explicitly null', () => {
+    expect(declaredFieldsFromSchema({ type: 'object', properties: null })).toBeUndefined();
+  });
+});
+
+describe('resolveNodeOutputField — producer did not run', () => {
+  it('throws producer-not-run for a skipped producer (clear message, not "unparseable")', () => {
+    try {
+      resolveField(
+        { state: 'skipped', output: '', cause: { kind: 'condition', expr: 'false' } },
+        'n',
+        'field'
+      );
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutputRefError);
+      expect((e as OutputRefError).reason).toBe('producer-not-run');
+    }
+  });
+
+  it('throws producer-not-run for a pending producer', () => {
+    expect(() => resolveField({ state: 'pending', output: '' }, 'n', 'field')).toThrow(
+      OutputRefError
+    );
+  });
+});
+
+describe('resolveNodeOutputField — producer failed (#2713)', () => {
+  it('names a nested reference as a path, not a field', () => {
+    const failed: NodeOutput = { state: 'failed', output: '{}', error: 'boom' };
+    expect(() => resolveField(failed, 'p', 'proposal.action')).toThrow(
+      "references path 'proposal.action', but node 'p' failed"
+    );
+    expect(() => resolveField(completed('not json'), 'p', 'proposal.action')).toThrow(
+      "so the path cannot be read. Emit JSON containing path 'proposal.action'"
+    );
+  });
+
+  it("throws producer-failed even when the failed producer's leftover output is real, valid JSON", () => {
+    // Mirrors a loop_group's failure paths: lastIterationOutput is real, non-empty text
+    // that happens to be valid JSON — exactly the shape that let the failed producer's
+    // stale output silently resolve before this fix (run 6607bf20 / #2696).
+    const failed: NodeOutput = {
+      state: 'failed',
+      output: JSON.stringify({ ready: true }),
+      error: 'loop failed at max_iterations',
+    };
+    try {
+      resolveField(failed, 'corrections', 'ready');
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutputRefError);
+      expect((e as OutputRefError).reason).toBe('producer-failed');
+      expect((e as OutputRefError).message).toContain("'corrections' failed");
+    }
+  });
+
+  it('throws producer-failed even when structuredOutput carries the field', () => {
+    const failed: NodeOutput = {
+      state: 'failed',
+      output: '',
+      error: 'boom',
+      structuredOutput: { ready: true },
+    };
+    expect(() => resolveField(failed, 'corrections', 'ready')).toThrow(OutputRefError);
+  });
+});
+
+// #2722 — the shared guard every whole-text $node.output reader routes through, mirroring
+// resolveNodeOutputField's own state === 'failed' guard for the fielded form.
+describe('assertProducerNotFailed', () => {
+  it.each(['completed', 'running', 'pending', 'skipped'] as const)(
+    'does not throw for a %s producer',
+    state => {
+      const nodeOutput: NodeOutput =
+        state === 'completed' || state === 'running'
+          ? { state, output: 'ok' }
+          : state === 'skipped'
+            ? { state, output: '', cause: { kind: 'condition', expr: 'false' } }
+            : { state, output: '' };
+      expect(() => assertProducerNotFailed(nodeOutput, () => 'unreachable')).not.toThrow();
+    }
+  );
+
+  it("throws with the caller's message for a failed producer", () => {
+    const failed: NodeOutput = { state: 'failed', output: 'stale', error: 'boom' };
+    expect(() =>
+      assertProducerNotFailed(failed, f => `custom message referencing ${f.error}`)
+    ).toThrow('custom message referencing boom');
+  });
+
+  it('passes the narrowed failed NodeOutput to buildMessage (error accessible without a cast)', () => {
+    const failed: NodeOutput = { state: 'failed', output: '', error: 'loop failed' };
+    let seenError: string | undefined;
+    expect(() =>
+      assertProducerNotFailed(failed, f => {
+        seenError = f.error;
+        return 'x';
+      })
+    ).toThrow();
+    expect(seenError).toBe('loop failed');
+  });
+});
+
+describe('resolveNodeOutputField — declared-schema producer', () => {
+  const declared = ['type', 'note'];
+
+  it('resolves a present declared field from structuredOutput', () => {
+    const r = resolveField(completed('{"type":"BUG"}', { type: 'BUG' }, declared), 'n', 'type');
+    expect(r).toEqual({ kind: 'value', value: 'BUG' });
+  });
+
+  it('declared-optional absent field → empty (not a throw)', () => {
+    const r = resolveField(completed('{"type":"BUG"}', { type: 'BUG' }, declared), 'n', 'note');
+    expect(r).toEqual({ kind: 'empty' });
+  });
+
+  it('explicit null on a declared field → empty', () => {
+    const r = resolveField(completed('{"type":null}', { type: null }, declared), 'n', 'type');
+    expect(r).toEqual({ kind: 'empty' });
+  });
+
+  it('field not in the declared schema → throws not-in-schema', () => {
+    expect(() =>
+      resolveField(completed('{"type":"BUG"}', { type: 'BUG' }, ['type']), 'n', 'tpye')
+    ).toThrow(OutputRefError);
+    try {
+      resolveField(completed('{"type":"BUG"}', { type: 'BUG' }, ['type']), 'n', 'tpye');
+    } catch (e) {
+      expect((e as OutputRefError).reason).toBe('not-in-schema');
+    }
+  });
+
+  it('falls back to parsing output when structuredOutput is absent (legacy declared row)', () => {
+    const r = resolveField(completed('{"type":"BUG"}', undefined, ['type']), 'n', 'type');
+    expect(r).toEqual({ kind: 'value', value: 'BUG' });
+  });
+
+  // #2456 — a declared schema must never be QUIETER than no schema at all. Before this,
+  // an unparseable output returned empty here while the schemaless path threw, so
+  // declaring output_format on a `workflow:` node (whose child output is never
+  // validated) silently turned every declared field into ''.
+  it('unparseable output → throws, exactly like the schemaless path (#2456)', () => {
+    const broken = completed('I could not produce JSON, sorry.', undefined, declared);
+    expect(() => resolveField(broken, 'n', 'type')).toThrow(OutputRefError);
+    try {
+      resolveField(broken, 'n', 'type');
+    } catch (e) {
+      expect((e as OutputRefError).reason).toBe('unparseable');
+    }
+  });
+
+  it('declaring a schema is never quieter than declaring none (#2456)', () => {
+    const text = 'not json at all';
+    const withSchema = (): unknown => resolveField(completed(text, undefined, ['f']), 'n', 'f');
+    const withoutSchema = (): unknown => resolveField(completed(text), 'n', 'f');
+    // Both throw, and for the same reason — that symmetry IS the contract.
+    expect(withSchema).toThrow(OutputRefError);
+    expect(withoutSchema).toThrow(OutputRefError);
+    const reasonOf = (fn: () => unknown): string | undefined => {
+      try {
+        fn();
+      } catch (e) {
+        return (e as OutputRefError).reason;
+      }
+      return undefined;
+    };
+    expect(reasonOf(withSchema)).toBe(reasonOf(withoutSchema));
+  });
+
+  // The leniency that SURVIVES: a declared-optional field missing from a payload that
+  // genuinely parsed. Only "no parseable object at all" changed.
+  it('still lenient for a missing key inside a parsed object (#2456 scope guard)', () => {
+    const r = resolveField(completed('{"type":"BUG"}', undefined, declared), 'n', 'note');
+    expect(r).toEqual({ kind: 'empty' });
+  });
+});
+
+/**
+ * Clipped-on-persist output parses no better than prose, but the author needs the
+ * opposite advice: the producer was right and a RESUMED run is reading the clipped
+ * copy. `output_format` lives on `dagNodeBaseSchema`, so a bash node can declare one
+ * — and bash stdout is the thing the event cap clips.
+ */
+describe('resolveNodeOutputField — output clipped before persistence', () => {
+  /** What `getDagResumeSnapshot` hands back for a bash node that exceeded the cap. */
+  function clipped(payload: string): string {
+    return payload.slice(0, 40) + buildTruncationMarker(Buffer.byteLength(payload));
+  }
+
+  const bigPayload = JSON.stringify({ verdict: 'pass', blob: 'x'.repeat(40_000) });
+
+  it('reports truncated, not unparseable, on the declared-schema path', () => {
+    const node = completed(clipped(bigPayload), undefined, ['verdict', 'blob']);
+    try {
+      resolveField(node, 'gen', 'verdict');
+      throw new Error('expected a throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutputRefError);
+      expect((e as OutputRefError).reason).toBe('truncated');
+    }
+  });
+
+  it('reports truncated on the schemaless path too — both paths stay symmetric', () => {
+    try {
+      resolveField(completed(clipped(bigPayload)), 'gen', 'verdict');
+      throw new Error('expected a throw');
+    } catch (e) {
+      expect((e as OutputRefError).reason).toBe('truncated');
+    }
+  });
+
+  it('does not blame truncation for output that merely mentions it', () => {
+    // The marker is anchored, so prose quoting the phrase mid-string is still a
+    // plain producer error — otherwise this branch would misdiagnose in reverse.
+    const prose = 'the log said … [truncated; original output was 5 bytes] and then stopped';
+    try {
+      resolveField(completed(prose, undefined, ['verdict']), 'gen', 'verdict');
+      throw new Error('expected a throw');
+    } catch (e) {
+      expect((e as OutputRefError).reason).toBe('unparseable');
+    }
+  });
+
+  it('says the producer was probably right, and points at the artifacts dir', () => {
+    const err = new OutputRefError('gen', 'verdict', 'truncated', {
+      reference: '$gen.output.verdict',
+    });
+    expect(err.message).toContain('clipped');
+    expect(err.message).toContain('$ARTIFACTS_DIR');
+    // The old advice was actively wrong here — the node DID emit the field.
+    expect(err.message).not.toContain('Emit JSON containing');
+  });
+
+  it('marker round-trips through build/detect', () => {
+    const output = `head${buildTruncationMarker(1234)}`;
+    expect(hasTruncationMarker(output)).toBe(true);
+    expect(hasTruncationMarker(`${output}\n \t`)).toBe(true);
+    expect(hasTruncationMarker('no marker here')).toBe(false);
+  });
+});
+
+describe('resolveNodeOutputField — structuredOutput without a declared schema (lenient)', () => {
+  it('resolves a present field', () => {
+    const r = resolveField(completed('prose', { type: 'BUG' }), 'n', 'type');
+    expect(r).toEqual({ kind: 'value', value: 'BUG' });
+  });
+
+  it('absent field → empty (no throw — cannot enforce a contract we do not have)', () => {
+    const r = resolveField(completed('prose', { type: 'BUG' }), 'n', 'missing');
+    expect(r).toEqual({ kind: 'empty' });
+  });
+
+  it('present null is kept as a value (callers stringify to "null")', () => {
+    const r = resolveField(completed('prose', { type: null }), 'n', 'type');
+    expect(r).toEqual({ kind: 'value', value: null });
+  });
+
+  it('non-object structuredOutput falls through to the schemaless path', () => {
+    // structuredOutput is an array → not a usable object → parse output instead.
+    const r = resolveField(completed('{"type":"BUG"}', [1, 2, 3]), 'n', 'type');
+    expect(r).toEqual({ kind: 'value', value: 'BUG' });
+  });
+});
+
+describe('resolveNodeOutputField — schemaless producer (bash/script/prose)', () => {
+  it('resolves a present key from JSON output', () => {
+    const r = resolveField(completed('{"status":"done"}'), 'n', 'status');
+    expect(r).toEqual({ kind: 'value', value: 'done' });
+  });
+
+  it('never reads an inherited property as a key', () => {
+    expect(() => resolveField(completed('{}'), 'n', 'toString')).toThrow('has no such key');
+    expect(resolveField(completed('{}', {}), 'n', 'toString')).toEqual({ kind: 'empty' });
+  });
+
+  it('strips a code fence before parsing', () => {
+    const r = resolveField(completed('```json\n{"status":"done"}\n```'), 'n', 'status');
+    expect(r).toEqual({ kind: 'value', value: 'done' });
+  });
+
+  it('non-JSON output → throws unparseable', () => {
+    try {
+      resolveField(completed('just prose'), 'n', 'status');
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutputRefError);
+      expect((e as OutputRefError).reason).toBe('unparseable');
+    }
+  });
+
+  it('valid JSON but missing key → throws missing-key', () => {
+    try {
+      resolveField(completed('{"status":"done"}'), 'n', 'other');
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutputRefError);
+      expect((e as OutputRefError).reason).toBe('missing-key');
+    }
+  });
+
+  it('top-level JSON array → throws unparseable (no named fields)', () => {
+    expect(() => resolveField(completed('[1,2,3]'), 'n', 'x')).toThrow(OutputRefError);
+  });
+});
+
+describe('OutputRefError — unknown-node', () => {
+  it('names the unknown id and the whole ref', () => {
+    const e = new OutputRefError('typo', 'field', 'unknown-node', {
+      reference: '$typo.output.field',
+    });
+    expect(e.reason).toBe('unknown-node');
+    expect(e.message).toContain("'typo'");
+    expect(e.message).toContain('$typo.output.field');
+    // Accurate for both a typo AND a real node that has not run before the ref.
+    expect(e.message).toContain('has not run before this reference');
+  });
+
+  it('appends a did-you-mean hint when candidates are supplied', () => {
+    const e = new OutputRefError('analze', 'type', 'unknown-node', {
+      reference: '$analze.output.type',
+      candidates: ['analyze', 'classify'],
+    });
+    expect(e.message).toContain('Did you mean');
+    expect(e.message).toContain("'analyze'");
+    expect(e.message).toContain("'classify'");
+  });
+
+  it('omits the did-you-mean hint when no candidates are close', () => {
+    const e = new OutputRefError('zzz', 'field', 'unknown-node', {
+      reference: '$zzz.output.field',
+      candidates: [],
+    });
+    expect(e.message).not.toContain('Did you mean');
+  });
+});
+
+describe('similarNodeIds', () => {
+  it('ranks the nearest known id first', () => {
+    const result = similarNodeIds('analze', ['analyze', 'build', 'classify']);
+    expect(result[0]).toBe('analyze');
+  });
+
+  it('returns [] when nothing is close', () => {
+    expect(similarNodeIds('xyzzy', ['analyze', 'build'])).toEqual([]);
+  });
+
+  it('accepts a Map keys iterable', () => {
+    const map = new Map<string, NodeOutput>([['analyze', completed('x')]]);
+    expect(similarNodeIds('analze', map.keys())).toContain('analyze');
+  });
+});
+
+describe('nested output acceptance', () => {
+  it('parses and resolves the complete proposal path', () => {
+    expect(parseWholeOutputRef('$review.output.proposal.action')).toEqual({
+      nodeId: 'review',
+      field: 'proposal.action',
+    });
+    expect(
+      resolveField(
+        { state: 'completed', output: '{"proposal":{"action":"add"}}' },
+        'review',
+        'proposal.action'
+      )
+    ).toEqual({ kind: 'value', value: 'add' });
+  });
+});
+
+describe('composed output contract', () => {
+  for (const keyword of ['allOf', 'anyOf', 'oneOf']) {
+    it(`projects and resolves mixed and composition-only ${keyword} declarations`, () => {
+      for (const direct of [{}, { properties: { direct: { type: 'number' } } }]) {
+        const schema = {
+          ...direct,
+          [keyword]: [
+            {
+              properties: { proposal: { properties: { action: { type: 'string' } } } },
+              required: keyword === 'oneOf' ? ['proposal'] : [],
+            },
+            {
+              properties: { alternate: { type: 'boolean' } },
+              required: keyword === 'oneOf' ? ['alternate'] : [],
+            },
+          ],
+        };
+        const declaredOutputPaths = declaredOutputPathsFromSchema(schema);
+        expect(declaredOutputPaths).toEqual([
+          ...('properties' in direct ? [['direct']] : []),
+          ['proposal'],
+          ['proposal', 'action'],
+          ['alternate'],
+        ]);
+        for (const value of [{ proposal: { action: 'add' } }, { alternate: true }]) {
+          expect(validateStructuredOutput(value, schema)).toEqual({ valid: true });
+          const output: NodeOutput = {
+            state: 'completed',
+            output: JSON.stringify(value),
+            declaredOutputPaths,
+          };
+          expect(resolveField(output, 'p', 'proposal.action')).toEqual(
+            'proposal' in value ? { kind: 'value', value: 'add' } : { kind: 'empty' }
+          );
+          for (const field of ['extra', 'proposal.typo']) {
+            expect(() => resolveField(output, 'p', field)).toThrow('not declared');
+          }
+        }
+      }
+    });
+    it(`keeps an empty ${keyword} contract strict`, () => {
+      const declaredOutputPaths = declaredOutputPathsFromSchema({ [keyword]: [true] });
+      expect(declaredOutputPaths).toEqual([]);
+      expect(() =>
+        resolveField(
+          { state: 'completed', output: '{"extra":1}', declaredOutputPaths },
+          'p',
+          'extra'
+        )
+      ).toThrow('not declared');
+    });
+  }
+
+  it('unions nested branches without conflating paths or traversing non-object schemas', () => {
+    const paths = declaredOutputPathsFromSchema({
+      properties: { root: {} },
+      allOf: [
+        {
+          anyOf: [
+            {
+              properties: {
+                root: {
+                  type: ['object', 'null'],
+                  oneOf: [{ properties: { a: {} } }, { properties: { b: {} } }],
+                },
+              },
+            },
+            { properties: { root: { properties: { a: {}, 'a.b': {} } } } },
+          ],
+        },
+        {
+          properties: {
+            'root.a': {},
+            scalar: { type: 'string', allOf: [{ properties: { hidden: {} } }] },
+            array: {
+              type: 'array',
+              items: { properties: { hidden: {} } },
+              anyOf: [{ properties: { hidden: {} } }],
+            },
+            branch: {
+              allOf: [
+                { type: 'number', properties: { hidden: {} } },
+                { properties: { visible: {} } },
+              ],
+            },
+            ref: { $ref: '#/$defs/object' },
+          },
+        },
+      ],
+      $defs: { object: { properties: { hidden: {} } } },
+      additionalProperties: { properties: { hidden: {} } },
+    });
+    expect(paths).toEqual([
+      ['root'],
+      ['root', 'a'],
+      ['root', 'b'],
+      ['root', 'a.b'],
+      ['root.a'],
+      ['scalar'],
+      ['array'],
+      ['branch'],
+      ['branch', 'visible'],
+      ['ref'],
+    ]);
+    for (const value of [{}, { root: null }]) {
+      expect(
+        resolveField(
+          { state: 'completed', output: JSON.stringify(value), declaredOutputPaths: paths },
+          'p',
+          'root.b'
+        )
+      ).toEqual({ kind: 'empty' });
+    }
+    for (const field of [
+      'root.a.b',
+      'scalar.hidden',
+      'array.hidden',
+      'branch.hidden',
+      'ref.hidden',
+    ]) {
+      expect(() => assertDeclaredOutputPath(paths ?? [], 'p', field, `$p.output.${field}`)).toThrow(
+        'not declared'
+      );
+    }
+    expect(() =>
+      resolveField(
+        { state: 'completed', output: '{"root":1}', declaredOutputPaths: paths },
+        'p',
+        'root.b'
+      )
+    ).toThrow('not an object');
+  });
+});
+
+describe('nested output contract', () => {
+  const schema = {
+    properties: {
+      proposal: {
+        type: ['object', 'null'],
+        properties: {
+          action: { type: 'string' },
+          details: { properties: { count: { type: 'number' } } },
+          items: { type: 'array', properties: { length: {} } },
+          scalar: { type: 'string', properties: { invalid: {} } },
+        },
+      },
+      'proposal.action': {},
+    },
+  };
+  const declaredOutputPaths = declaredOutputPathsFromSchema(schema);
+  const producer = (value: unknown): NodeOutput => ({
+    state: 'completed',
+    output: JSON.stringify(value),
+    declaredOutputPaths,
+  });
+  it('projects explicit object properties without conflating dotted literal keys', () => {
+    expect(declaredOutputPaths).toEqual([
+      ['proposal'],
+      ['proposal', 'action'],
+      ['proposal', 'details'],
+      ['proposal', 'details', 'count'],
+      ['proposal', 'items'],
+      ['proposal', 'scalar'],
+      ['proposal.action'],
+    ]);
+    expect(declaredOutputPathsFromSchema({ properties: {} })).toEqual([]);
+    expect(declaredOutputPathsFromSchema({ type: 'string' })).toBeUndefined();
+    expect(() => assertDeclaredOutputPath([['a.b']], 'p', 'a.b', '$p.output.a.b')).toThrow(
+      "field 'a'"
+    );
+  });
+  it('checks every prefix before accepting an absent or null optional parent', () => {
+    for (const value of [{}, { proposal: null }, { proposal: {} }]) {
+      expect(resolveField(producer(value), 'p', 'proposal.action')).toEqual({
+        kind: 'empty',
+      });
+      expect(() => resolveField(producer(value), 'p', 'proposal.typo')).toThrow("field 'typo'");
+    }
+    for (const path of [
+      'typo.action',
+      'proposal.details.typo',
+      'proposal.items.length',
+      'proposal.scalar.invalid',
+    ]) {
+      expect(() => resolveField(producer({}), 'p', path)).toThrow('not declared');
+    }
+  });
+  it('preserves scalar and aggregate logical values', () => {
+    expect(
+      resolveField(producer({ proposal: { details: { count: 0 } } }), 'p', 'proposal.details.count')
+    ).toEqual({ kind: 'value', value: 0 });
+    for (const value of [false, { count: 0 }, [1, 2]]) {
+      expect(
+        resolveField(producer({ proposal: { details: value } }), 'p', 'proposal.details')
+      ).toEqual({ kind: 'value', value });
+    }
+  });
+  it('requires own object properties for schemaless nested paths, even on legacy structured payloads', () => {
+    for (const value of [
+      {},
+      { proposal: {} },
+      { proposal: null },
+      { proposal: [] },
+      { proposal: 'text' },
+      { 'proposal.action': 'add' },
+      { proposal: Object.create({ action: 'inherited' }) },
+    ]) {
+      const node: NodeOutput = {
+        state: 'completed',
+        output: JSON.stringify(value),
+        structuredOutput: value,
+      };
+      expect(() => resolveField(node, 'p', 'proposal.action')).toThrow(OutputRefError);
+    }
+    expect(
+      resolveField(
+        { state: 'completed', output: '{"proposal":{"action":null}}' },
+        'p',
+        'proposal.action'
+      )
+    ).toEqual({ kind: 'value', value: null });
+  });
+});
+
+it('reads child path metadata, a legacy root-field contract, and fails malformed paths', () => {
+  expect(readSubrunMetadata({}).summaryDeclaredOutputPaths).toBeUndefined();
+  expect(
+    readSubrunMetadata({ summary_declared_fields: ['green', 'note'] }).summaryDeclaredOutputPaths
+  ).toEqual([['green'], ['note']]);
+  expect(
+    readSubrunMetadata({ summary_declared_output_paths: [] }).summaryDeclaredOutputPaths
+  ).toEqual([]);
+  for (const bad of [null, undefined, [[]], ['proposal']]) {
+    expect(() => readSubrunMetadata({ summary_declared_output_paths: bad })).toThrow();
+  }
+});

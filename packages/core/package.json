@@ -1,0 +1,66 @@
+{
+  "name": "@archon/core",
+  "version": "0.13.2",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./providers/register-host-providers": "./src/providers/register-host-providers.ts",
+    "./providers/load-provider-plugins": "./src/providers/load-provider-plugins.ts",
+    "./providers/inspect-provider-plugin": "./src/providers/inspect-provider-plugin.ts",
+    "./providers/process-registration": "./src/providers/process-registration.ts",
+    "./effort": "./src/effort.ts",
+    "./types": "./src/types/index.ts",
+    "./db": "./src/db/index.ts",
+    "./db/*": "./src/db/*.ts",
+    "./operations": "./src/operations/index.ts",
+    "./operations/*": "./src/operations/*.ts",
+    "./workflows": "./src/workflows/index.ts",
+    "./workflows/*": "./src/workflows/*.ts",
+    "./isolation-store": "./src/db/isolation-environments.ts",
+    "./handlers": "./src/handlers/command-handler.ts",
+    "./config": "./src/config/index.ts",
+    "./config/run-config-handoff": "./src/config/run-config-handoff.ts",
+    "./utils/*": "./src/utils/*.ts",
+    "./services/*": "./src/services/*.ts",
+    "./state/*": "./src/state/*.ts",
+    "./schemas": "./src/schemas/index.ts",
+    "./schemas/*": "./src/schemas/*.ts",
+    "./platforms/chat-plugins": "./src/platforms/chat-plugins.ts",
+    "./platforms/registry": "./src/platforms/registry.ts",
+    "./platforms/types": "./src/platforms/types.ts",
+    "./github-auth/config": "./src/github-auth/config.ts",
+    "./handlers/clone": "./src/handlers/clone.ts",
+    "./config/config-loader": "./src/config/config-loader.ts",
+    "./config/store-selection": "./src/config/store-selection.ts"
+  },
+  "scripts": {
+    "test": "bun run ../../scripts/package-tests.ts",
+    "type-check": "bun x tsc --noEmit",
+    "build": "echo 'No build needed - Bun runs TypeScript directly'"
+  },
+  "testConcurrency": 2,
+  "dependencies": {
+    "@archon/plugin-manifest": "workspace:*",
+    "@archon/git": "workspace:*",
+    "@archon/isolation": "workspace:*",
+    "@archon/paths": "workspace:*",
+    "@archon/provider-contract": "workspace:*",
+    "@archon/providers": "workspace:*",
+    "@archon/workflows": "workspace:*",
+    "@hono/zod-openapi": "^1.4.0",
+    "@octokit/auth-app": "^8.0.0",
+    "@octokit/rest": "^22.0.0",
+    "pg": "^8.11.0",
+    "zod": "^4.4.3",
+    "@archon/chat-contract": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.0",
+    "pino": "^9"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

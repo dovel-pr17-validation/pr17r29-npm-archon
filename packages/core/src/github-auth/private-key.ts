@@ -1,0 +1,59 @@
+/**
+ * Resolve the GitHub App private key from environment variables.
+ *
+ * Order of preference:
+ *   1. GITHUB_APP_PRIVATE_KEY — PEM contents inline. Supports the .env
+ *      convention of representing newlines as the literal two-char `\n`.
+ *   2. GITHUB_APP_PRIVATE_KEY_PATH — absolute path to a `.pem` file.
+ *
+ * Throws AppPrivateKeyError on missing config or missing PEM markers.
+ * Cryptographic validation belongs to `loadGitHubAppConfig`; this helper owns
+ * key-source precedence and normalization.
+ */
+import { readFileSync } from 'node:fs';
+import { AppPrivateKeyError } from './errors';
+
+export function loadAppPrivateKey(env: NodeJS.ProcessEnv = process.env): string {
+  const inline = env.GITHUB_APP_PRIVATE_KEY;
+  if (inline?.trim()) {
+    // Allow `KEY="...\n..."` style .env values where newlines are escape-
+    // encoded. Both `\\n` (two-char escape from a quoted .env value) and
+    // `\\r\\n` (Windows-edited .env) collapse to real `\n`.
+    const normalized = inline.replace(/\\r\\n|\\n/g, '\n').replace(/\r\n/g, '\n');
+    assertLooksLikePem(normalized);
+    return normalized;
+  }
+  const path = env.GITHUB_APP_PRIVATE_KEY_PATH;
+  if (path?.trim()) {
+    try {
+      const raw = readFileSync(path, 'utf8');
+      // Windows-edited .pem files arrive with CRLF; OpenSSL tolerates it but
+      // some SSH-style key parsers don't. Normalise so downstream JWT signing
+      // never has to care.
+      const contents = raw.replace(/\r\n/g, '\n');
+      assertLooksLikePem(contents);
+      return contents;
+    } catch (err) {
+      if (err instanceof AppPrivateKeyError) throw err;
+      // The value may be a key pasted into the wrong variable, and the fs error
+      // repeats it, so only the errno code is surfaced.
+      const code = (err as NodeJS.ErrnoException).code;
+      throw new AppPrivateKeyError(
+        `Failed to read the file named by GITHUB_APP_PRIVATE_KEY_PATH${code ? ` (${code})` : ''}. ` +
+          'Set it to the path of a readable .pem file, or put the key itself in GITHUB_APP_PRIVATE_KEY.'
+      );
+    }
+  }
+  throw new AppPrivateKeyError(
+    'GITHUB_APP_ID is set but no private key was provided. ' +
+      'Set GITHUB_APP_PRIVATE_KEY (inline PEM) or GITHUB_APP_PRIVATE_KEY_PATH (path to .pem).'
+  );
+}
+
+function assertLooksLikePem(s: string): void {
+  if (!s.includes('BEGIN') || !s.includes('PRIVATE KEY') || !s.includes('END')) {
+    throw new AppPrivateKeyError(
+      'Provided value is not a valid PEM-encoded private key (missing BEGIN/END markers).'
+    );
+  }
+}

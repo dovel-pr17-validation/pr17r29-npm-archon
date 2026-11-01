@@ -1,0 +1,139 @@
+/**
+ * Cleans process.env at startup — BEFORE any module reads env at init time
+ * (notably `@archon/paths/logger` which reads `LOG_LEVEL` during module load).
+ *
+ * Two concerns handled in one pass:
+ *
+ * 1. CWD .env isolation: every key named in the target project's .env /
+ *    .env.local / .env.development / .env.production is removed, regardless
+ *    of its value or source (including shell exports and direnv). A leaked
+ *    ANTHROPIC_API_KEY can override Claude subscription auth and incur API
+ *    billing; other project keys can override Archon's defaults/environment.
+ *    Install credentials belong in ~/.archon/.env, loaded after this strip.
+ *    Exception: a detached child (--internal-detached-run-config) gets the six
+ *    DETACHED_INSTALL_CONTEXT_KEYS restored afterwards from the trusted detached
+ *    config, never from the project .env.
+ *
+ * 2. Nested Claude Code session markers: When archon is launched from inside a
+ *    Claude Code terminal, the parent shell exports CLAUDECODE=1 and several
+ *    CLAUDE_CODE_* markers. The Claude Agent SDK leaks process.env into the
+ *    spawned child regardless of the explicit `env` option
+ *    (see coleam00/Archon#1097), so the only way to prevent the nested-session
+ *    deadlock is to delete the markers from process.env at the entry point.
+ *    Auth vars (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK,
+ *    CLAUDE_CODE_USE_VERTEX) are kept.
+ */
+import { config } from 'dotenv';
+import { resolve } from 'path';
+import {
+  captureDetachedInstallContext,
+  restoreDetachedInstallContext,
+} from './detached-install-context';
+
+/** Project env filenames parsed for key-name isolation. */
+const BUN_AUTO_LOADED_ENV_FILES = ['.env', '.env.local', '.env.development', '.env.production'];
+
+/** CLAUDE_CODE_* vars that are auth-related and must be kept in process.env. */
+const CLAUDE_CODE_AUTH_VARS = new Set([
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+]);
+
+/**
+ * Strip every key named in CWD .env files, whatever its value or source
+ * (detached children then restore DETACHED_INSTALL_CONTEXT_KEYS), and nested Claude Code session markers from process.env.
+ * Keys in ~/.archon/.env (loaded afterward by each entry point) are unaffected.
+ * Safe to call even when no CWD .env files exist.
+ */
+export function stripCwdEnv(cwd: string = process.cwd()): void {
+  const preserveDetachedInstallContext = process.argv
+    .slice(2)
+    .includes('--internal-detached-run-config');
+  const inheritedInstallContext = preserveDetachedInstallContext
+    ? captureDetachedInstallContext()
+    : undefined;
+
+  const { cwdKeys, strippedFiles } = collectCwdEnvKeys(cwd);
+
+  for (const key of cwdKeys) {
+    Reflect.deleteProperty(process.env, key);
+  }
+
+  // A detached parent already sealed the run config with this install context.
+  // Bun's target-repo .env stripping must not delete it before CLI boot can
+  // protect it from the later Archon-owned env layers too.
+  if (inheritedInstallContext) {
+    restoreDetachedInstallContext(inheritedInstallContext);
+  }
+
+  // Tell the operator what we just did — otherwise the delete loop is silent
+  // and users think their env file was loaded (see #1302).
+  if (cwdKeys.size > 0) {
+    process.stderr.write(
+      `[archon] stripped ${cwdKeys.size} keys from ${cwd} (${strippedFiles.join(', ')}) to prevent target repo env from leaking into Archon processes\n`
+    );
+  }
+
+  stripNestedSessionMarkers();
+  stripDebuggerEnv();
+}
+
+function stripNestedSessionMarkers(): void {
+  // Pattern-matched (not hardcoded) so new CLAUDE_CODE_* markers added by
+  // future Claude Code versions are automatically handled.
+  if (process.env.CLAUDECODE) {
+    Reflect.deleteProperty(process.env, 'CLAUDECODE');
+  }
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('CLAUDE_CODE_') && !CLAUDE_CODE_AUTH_VARS.has(key)) {
+      Reflect.deleteProperty(process.env, key);
+    }
+  }
+}
+
+function stripDebuggerEnv(): void {
+  // Strip debugger vars that crash Claude Code subprocesses
+  // See: https://github.com/anthropics/claude-code/issues/4619
+  Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
+  Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
+  // Bun inspector vars (BUN_INSPECT, BUN_INSPECT_NOTIFY, ...) injected by IDE
+  // debuggers (e.g. PyCharm's Bun plugin) make every spawned bun subprocess try
+  // to bind the parent's debug socket → EADDRINUSE crash loop (see #2030).
+  // Bun read these before user code ran, so deleting them here never detaches
+  // the CURRENT process from its debugger — it only stops the leak into children.
+  // Pattern-matched so future BUN_INSPECT_* additions are covered too.
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('BUN_INSPECT')) {
+      Reflect.deleteProperty(process.env, key);
+    }
+  }
+}
+
+function collectCwdEnvKeys(cwd: string): { cwdKeys: Set<string>; strippedFiles: string[] } {
+  const cwdKeys = new Set<string>();
+  const strippedFiles: string[] = [];
+  for (const filename of BUN_AUTO_LOADED_ENV_FILES) {
+    const filepath = resolve(cwd, filename);
+    // dotenv.config with processEnv:{} parses without writing to process.env.
+    // quiet:true suppresses dotenv's `[dotenv@...] injecting env …` tip line —
+    // which always reports (0) here because processEnv:{} is a throwaway object
+    // and would mislead operators into thinking the file was empty (see #1302).
+    const result = config({ path: filepath, processEnv: {}, quiet: true });
+    if (result.error) {
+      // ENOENT is expected (file simply doesn't exist) — all others are unexpected
+      const code = (result.error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') {
+        process.stderr.write(
+          `[archon] Warning: could not parse ${filepath} for CWD env stripping: ${result.error.message}\n`
+        );
+      }
+      continue;
+    }
+    const parsedKeys = Object.keys(result.parsed ?? {});
+    if (parsedKeys.length === 0) continue;
+    strippedFiles.push(filename);
+    for (const key of parsedKeys) cwdKeys.add(key);
+  }
+  return { cwdKeys, strippedFiles };
+}

@@ -1,0 +1,150 @@
+---
+description: Run Archon's full validation suite with per-level reporting
+---
+
+# Validate: Comprehensive Archon Validation
+
+## Objective
+
+Run all four validation levels for the Archon monorepo and report pass/fail with actionable
+diagnostics. All four must pass before a PR can be created.
+
+---
+
+## Level 1: Type Checking
+
+```bash
+bun run type-check
+```
+
+Runs the workspace and script type-checks defined by the root `package.json`. Use `.archon/architecture.md` for package ownership and boundaries.
+
+**What to look for:**
+- Incorrect interface implementations (`IPlatformAdapter`, `IAgentProvider`, etc.)
+- Import type errors (use `import type` for type-only imports)
+- Package boundary violations (e.g., `@archon/workflows` importing from `@archon/core`)
+
+---
+
+## Level 2: Linting
+
+```bash
+bun run lint
+```
+
+Biome runs with warnings as errors, after the test-cleanup drift and workflow
+persistence checks. Any diagnostic is a failure.
+
+**What to look for:**
+- `noExplicitAny` violations — fix the type, don't suppress
+- Non-null assertions or empty blocks in source files
+- Restricted imports (provider admission, the console's store)
+
+To auto-fix safe lint issues:
+```bash
+bun run lint:fix
+```
+
+---
+
+## Level 3: Biome Format Check
+
+```bash
+bun run format:check
+```
+
+Checks files included by the formatter configuration in `biome.jsonc`.
+
+**What to look for:**
+- Inconsistent indentation (2 spaces)
+- Missing/extra semicolons
+- Quote style (single quotes)
+- Trailing whitespace, line endings
+
+To auto-fix formatting:
+```bash
+bun run format
+```
+
+---
+
+## Level 4: Tests
+
+```bash
+bun run test
+```
+
+This runs `bun --filter '*' test` for per-package isolation. **Never run `bun test` from the
+repo root** — it causes ~135 mock pollution failures due to Bun's global `mock.module()` cache.
+
+**Package test isolation notes:**
+- `@archon/core` — 7 separate `bun test` batches (mock.module pollution prevention)
+- `@archon/workflows` — 5 batches
+- `@archon/adapters` — 3 batches
+- `@archon/isolation` — 3 batches
+
+**What to look for:**
+- Failing unit tests (fix root cause, not the test assertion)
+- Flaky tests (timing/network dependencies — add proper mocking)
+- Missing test coverage for new code
+
+To run a single test file during debugging:
+```bash
+bun test packages/core/src/handlers/command-handler.test.ts
+```
+
+To run tests for a single package:
+```bash
+bun --filter @archon/workflows test
+```
+
+---
+
+## Level 5: Full Validation (CI Gate)
+
+```bash
+bun run validate
+```
+
+`scripts/validate.ts` lists what this runs; the levels above are a subset of it.
+
+This is the command CI runs. `CONTRIBUTING.md` lists the PostgreSQL, Docker and docs
+jobs kept outside it, with the command to run each one.
+
+---
+
+## Output Report
+
+After running all levels, provide this report:
+
+```
+## Validation Report
+
+| Level | Command | Result | Details |
+|-------|---------|--------|---------|
+| 1 | bun run type-check | PASS / FAIL | N errors |
+| 2 | bun run lint | PASS / FAIL | N warnings |
+| 3 | bun run format:check | PASS / FAIL | N files |
+| 4 | bun run test | PASS / FAIL | N passed, N failed |
+| 5 | bun run validate | PASS / FAIL | — |
+
+### Failures (if any)
+
+#### Type Errors
+{List specific errors with file:line references}
+
+#### Lint Warnings/Errors
+{List specific violations with file:line references}
+
+#### Format Issues
+{List files with formatting problems}
+
+#### Test Failures
+{List failing test names and error messages}
+
+### Recommended Fixes
+{Prioritized list of what to fix, in order}
+```
+
+**Tip:** Fix in this order — types first (lint often clears up after type fixes), then lint,
+then format (always auto-fixable), then tests last.

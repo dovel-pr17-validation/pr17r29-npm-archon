@@ -1,0 +1,595 @@
+---
+title: New Developer Guide
+description: Codebase orientation for new Archon developers — architecture overview, workflows, platforms, and first steps.
+category: contributing
+audience: [developer]
+status: current
+sidebar:
+  order: 1
+---
+
+> **TL;DR**: Archon lets you control AI coding assistants (Claude Code, Codex) from your phone via Telegram, Slack, Discord, or GitHub. Think of it as a remote control for AI pair programming.
+
+---
+
+## The Problem We Solve
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        WITHOUT ARCHON                               │
+│                                                                     │
+│   You're on the train, phone in hand...                            │
+│                                                                     │
+│   ┌──────────┐     ❌ Can't SSH      ┌──────────────────┐          │
+│   │  Phone   │ ──────────────────────│  Dev Machine     │          │
+│   │          │     ❌ No terminal    │  (Claude Code)   │          │
+│   └──────────┘     ❌ No IDE         └──────────────────┘          │
+│                                                                     │
+│   "I wish I could just message Claude to fix that bug..."          │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                         WITH ARCHON                                 │
+│                                                                     │
+│   ┌──────────┐                       ┌──────────────────┐          │
+│   │  Phone   │ ─────Telegram────────▶│  Archon Server   │          │
+│   │          │     "fix issue #42"   │                  │          │
+│   └──────────┘                       │  ┌────────────┐  │          │
+│        │                             │  │Claude Code │  │          │
+│        │                             │  │   SDK      │  │          │
+│        │                             │  └─────┬──────┘  │          │
+│        │                             │        │         │          │
+│        │                             │  ┌─────▼──────┐  │          │
+│        │◀────"PR created #127"───────│  │ Git Repo   │  │          │
+│        │                             │  │ (worktree) │  │          │
+│                                      │  └────────────┘  │          │
+│                                      └──────────────────┘          │
+│                                                                     │
+│   You just fixed a bug from your phone.                            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Core Concept: Message → AI → Code → Response
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│   USER                    ARCHON                         CODEBASE        │
+│                                                                          │
+│   ┌─────────┐            ┌─────────────────┐            ┌──────────┐    │
+│   │Telegram │            │                 │            │          │    │
+│   │  Slack  │───Message─▶│   Orchestrator  │───Claude──▶│ Git Repo │    │
+│   │ Discord │            │                 │   Code     │          │    │
+│   │ GitHub  │◀──Response─│   (routes to    │◀──────────│ (files)  │    │
+│   └─────────┘            │    AI client)   │            └──────────┘    │
+│                          └─────────────────┘                             │
+│                                                                          │
+│   That's it. You message, AI works on code, you get results.            │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Four Ways to Use Archon
+
+### 1. Command Line (Local Execution)
+
+Run workflows directly from your terminal without needing the server:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ TERMINAL                                                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│ $ bun run cli workflow list                                     │
+│                                                                 │
+│ Available workflows in .archon/workflows/:                     │
+│   - archon-ship                  Issue to reviewed PR           │
+│   - archon-investigate           Prove a root cause             │
+│   - archon-review                Parallel PR review             │
+│                                                                 │
+│ $ bun run cli workflow run archon-investigate "What does the    │
+│   orchestrator do?"                                             │
+│                                                                 │
+│ 🔧 READ                                                         │
+│ Reading: packages/core/src/orchestrator/orchestrator.ts                │
+│                                                                 │
+│ The orchestrator is the main entry point that routes incoming  │
+│ messages. It checks if it's a slash command, loads conversation│
+│ context from the database, and routes to the appropriate AI     │
+│ client for processing...                                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Good for:** Running workflows locally, testing, automation scripts, CI/CD
+
+### 2. Direct Chat (Simple Questions)
+
+Just talk to the AI like you would in Claude Code terminal:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ TELEGRAM CHAT                                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│ You: What does the handleMessage function do?                   │
+│                                                                 │
+│ Archon: Looking at packages/core/src/orchestrator/orchestrator.ts...          │
+│                                                                 │
+│         The handleMessage function is the main entry point      │
+│         that routes incoming messages. It:                      │
+│         1. Checks if it's a slash command                       │
+│         2. Loads conversation context from database             │
+│         3. Routes to AI client for processing                   │
+│         4. Streams responses back to platform                   │
+│                                                                 │
+│         See: packages/core/src/orchestrator/orchestrator.ts            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Slash Commands (Specific Operations)
+
+Deterministic commands that don't involve AI:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ SLASH COMMANDS                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│ /clone https://github.com/user/repo    Clone a repository      │
+│ /status                                 Show current state      │
+│ /repos                                  List available repos    │
+│ /setcwd /path/to/dir                   Change working dir      │
+│ /reset                                  Clear AI session        │
+│ /help                                   Show all commands       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4. Workflows (Multi-Step Automation)
+
+This is where Archon shines - automated multi-step AI workflows:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ GITHUB ISSUE #42                                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│ Title: Login button doesn't work on mobile                      │
+│                                                                 │
+│ ─────────────────────────────────────────────────────────────── │
+│                                                                 │
+│ @user commented:                                                │
+│   @archon fix this issue                                        │
+│                                                                 │
+│ ─────────────────────────────────────────────────────────────── │
+│                                                                 │
+│ @archon commented:                                              │
+│   🔍 Investigation Complete                                     │
+│                                                                 │
+│   Root Cause: Touch event handler missing on mobile             │
+│   File: packages/server/src/components/LoginButton.tsx:45                       │
+│   Fix: Add onTouchEnd handler alongside onClick                 │
+│                                                                 │
+│   Creating PR...                                                │
+│                                                                 │
+│ ─────────────────────────────────────────────────────────────── │
+│                                                                 │
+│ @archon commented:                                              │
+│   ✅ Fix implemented: PR #127                                   │
+│   - Added touch event handling                                  │
+│   - Added mobile viewport tests                                 │
+│   - All tests passing                                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How Workflows Work (The Magic)
+
+A workflow is a YAML file that chains AI prompts together:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   .archon/workflows/fix-github-issue.yaml                              │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ name: fix-github-issue                                          │  │
+│   │ description: Investigate and fix a GitHub issue                 │  │
+│   │                                                                 │  │
+│   │ nodes:                                                          │  │
+│   │   - id: investigate                                             │  │
+│   │     command: investigate-issue    ◀── Node 1: Research         │  │
+│   │   - id: implement                                               │  │
+│   │     command: implement-issue      ◀── Node 2: Fix              │  │
+│   │     depends_on: [investigate]                                   │  │
+│   │     context: fresh                                              │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│                              │                                          │
+│                              ▼                                          │
+│                                                                         │
+│   EXECUTION FLOW:                                                       │
+│                                                                         │
+│   ┌──────────────────┐      ┌──────────────────┐      ┌────────────┐  │
+│   │  investigate-    │      │   implement-     │      │            │  │
+│   │  issue.md        │─────▶│   issue.md       │─────▶│  PR #127   │  │
+│   │                  │      │                  │      │            │  │
+│   │  - Read issue    │      │  - Read artifact │      │  Created!  │  │
+│   │  - Explore code  │      │  - Make changes  │      │            │  │
+│   │  - Find root     │      │  - Run tests     │      │            │  │
+│   │    cause         │      │  - Commit        │      │            │  │
+│   │  - Save artifact │      │  - Create PR     │      │            │  │
+│   └──────────────────┘      └──────────────────┘      └────────────┘  │
+│                                                                         │
+│   Each "command" is a markdown file with AI instructions.              │
+│   The workflow executor runs nodes in dependency order.                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Router: How Archon Picks Workflows
+
+When you send a message, an AI "router" decides what to do:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   USER MESSAGE                           ROUTER DECISION                │
+│                                                                         │
+│   "fix this issue"          ───────▶     archon-ship                   │
+│   "review this PR"          ───────▶     archon-review                 │
+│   "what does X do?"         ───────▶     answered directly, no workflow│
+│   "update sharp"            ───────▶     archon-upkeep                 │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   HOW IT WORKS:                                                         │
+│                                                                         │
+│   ┌──────────┐     ┌─────────────────────────────────────┐             │
+│   │ Message  │────▶│ Router AI reads workflow descriptions│             │
+│   │          │     │ and picks the best match             │             │
+│   └──────────┘     └──────────────────┬──────────────────┘             │
+│                                       │                                 │
+│                                       ▼                                 │
+│                    ┌─────────────────────────────────────┐             │
+│                    │ invoke_workflow: archon-ship        │             │
+│                    └─────────────────────────────────────┘             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Available Workflows
+
+The table below lists the key workflows in the bundled `sdlc` pack. All bundled workflows are prefixed with `archon-`. Run `bun run cli workflow list` to see the full current list.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   WORKFLOW                              TRIGGER PHRASES    WHAT IT DOES │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ archon-ship               "fix this issue"        Triage +       │  │
+│   │                           "implement #42"         deliver a PR   │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ archon-review             "review this PR"        Parallel       │  │
+│   │                           "is this ready"         review lenses  │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ archon-deliver            "deliver this plan"     Implement +    │  │
+│   │                           "take this to a PR"     PR + review    │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ archon-upkeep             "update sharp"          One dependency │  │
+│   │                           "bump X to latest"      bump + PR      │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Parallel Agents: The PR Review Example
+
+A quick route agent picks which specialist lenses the change earns, and `archon-review` runs them in fresh sessions as shown below. The code lens uses the configured `large` model tier.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   USER: "review this PR"                                               │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ Step 1: scope + route          Resolve the PR, its diff, the    │  │
+│   │                                contract, and which lenses run   │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ Step 2: PARALLEL LENSES (each in a fresh session)               │  │
+│   │                                                                 │  │
+│   │   ┌──────────────┐  ┌──────────────┐                           │  │
+│   │   │ code         │  │ seams        │                           │  │
+│   │   │              │  │              │                           │  │
+│   │   │ Bugs,        │  │ Contracts    │                           │  │
+│   │   │ correctness  │  │ that drift   │                           │  │
+│   │   └──────────────┘  └──────────────┘                           │  │
+│   │                                                                 │  │
+│   │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │  │
+│   │   │ tests        │  │ errors       │  │ docs         │         │  │
+│   │   │              │  │              │  │ (when docs   │         │  │
+│   │   │ Missing      │  │ Visibility & │  │  change)     │         │  │
+│   │   │ coverage     │  │ containment  │  │ Stale docs   │         │  │
+│   │   └──────────────┘  └──────────────┘  └──────────────┘         │  │
+│   │                                                                 │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ Step 3: synthesize             Combine findings into one verdict│  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ Step 4: publish                Post one review comment on the PR│  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Review never edits code. Fixing findings belongs to `archon-implement`, or to `archon-deliver`, which runs review and corrections in a loop.
+
+---
+
+## Platform Integration
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   CLI                               HOW IT WORKS                        │
+│   ─────────────────────────────────────────────────────────────────    │
+│   ┌──────────────────┐              - Direct command execution         │
+│   │  Terminal        │              - Real-time streaming to stdout    │
+│   │                  │              - No server needed                 │
+│   │  bun run cli     │              - Good for local workflows         │
+│   │  workflow run    │              - Perfect for CI/CD                │
+│   └──────────────────┘                                                  │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   TELEGRAM                          HOW IT WORKS                        │
+│   ─────────────────────────────────────────────────────────────────    │
+│   ┌──────────────────┐              - Bot polls for messages           │
+│   │  @archon_bot     │              - Real-time streaming (default)    │
+│   │                  │              - DM the bot directly              │
+│   │  "fix issue #42" │              - Good for mobile use              │
+│   └──────────────────┘                                                  │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   SLACK                             HOW IT WORKS                        │
+│   ─────────────────────────────────────────────────────────────────    │
+│   ┌──────────────────┐              - Socket Mode (no webhooks)        │
+│   │  #dev-channel    │              - @mention in threads              │
+│   │                  │              - DM the bot                       │
+│   │  @archon review  │              - Good for team visibility         │
+│   │  this PR         │                                                  │
+│   └──────────────────┘                                                  │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   DISCORD                           HOW IT WORKS                        │
+│   ─────────────────────────────────────────────────────────────────    │
+│   ┌──────────────────┐              - WebSocket connection             │
+│   │  #coding-help    │              - @mention to activate             │
+│   │                  │              - Thread support                   │
+│   │  @Archon what    │              - Good for communities             │
+│   │  does this do?   │                                                  │
+│   └──────────────────┘                                                  │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   GITHUB                            HOW IT WORKS                        │
+│   ─────────────────────────────────────────────────────────────────    │
+│   ┌──────────────────┐              - Webhook on issues/PRs            │
+│   │  Issue #42       │              - @archon in comments              │
+│   │                  │              - Batch mode (assembled reply)     │
+│   │  @archon fix     │              - Auto-creates PRs                 │
+│   │  this issue      │              - Good for automation              │
+│   └──────────────────┘                                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+Batch mode assembles the reply before delivery. Adapters may split long replies into multiple messages or comments.
+
+## Isolation: Git Worktrees
+
+Each conversation gets its own isolated copy of the repo:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   ~/.archon/workspaces/owner/repo/worktrees/                           │
+│   │                                                                     │
+│   ├── issue-42/              ◀── Conversation about issue #42         │
+│   │   └── (full repo)            Working on fix for mobile bug         │
+│   │                                                                     │
+│   ├── pr-127/                ◀── Conversation about PR #127           │
+│   │   └── (full repo)            Reviewing code changes                │
+│   │                                                                     │
+│   └── task-dark-mode/        ◀── Manual feature work                  │
+│       └── (full repo)            Adding dark mode feature              │
+│                                                                         │
+│   WHY WORKTREES?                                                        │
+│   ─────────────────────────────────────────────────────────────────    │
+│   - Multiple conversations can work simultaneously                     │
+│   - No branch conflicts between parallel work                          │
+│   - Each gets isolated file changes                                    │
+│   - Cleaned up when issue/PR closes                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Configuration Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   CONFIGURATION LAYERS (later overrides earlier)                       │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ 1. DEFAULTS (hardcoded)                                         │  │
+│   │    assistant: claude                                            │  │
+│   │    streaming.telegram: stream                                   │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ 2. GLOBAL CONFIG (~/.archon/config.yaml)                        │  │
+│   │    botName: MyBot                                               │  │
+│   │    defaultAssistant: claude                                     │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ 3. REPO CONFIG (.archon/config.yaml)                            │  │
+│   │    assistant: codex          # This repo prefers Codex          │  │
+│   │    commands:                                                    │  │
+│   │      folder: .claude/commands/custom                            │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ 4. ENVIRONMENT VARIABLES (highest priority)                     │  │
+│   │    TELEGRAM_STREAMING_MODE=batch                                │  │
+│   │    DEFAULT_AI_ASSISTANT=claude                                  │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Directory Structure
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   YOUR REPO                         ARCHON SERVER                       │
+│                                                                         │
+│   my-app/                           ~/.archon/                          │
+│   ├── .archon/                      ├── config.yaml      (global cfg)  │
+│   │   ├── config.yaml               ├── workspaces/      (cloned repos)│
+│   │   ├── commands/                 │   └── user/repo/                 │
+│   │   │   ├── investigate-issue.md  │       ├── source/    (clone)      │
+│   │   │   ├── implement-issue.md   │       └── worktrees/ (isolation)  │
+│   │   │   └── assist.md            │           ├── issue-42/           │
+│   │   ├── workflows/               │           └── pr-127/             │
+│   │   │   ├── fix-github-issue.yaml                                    │
+│   │   │   └── assist.yaml                                              │
+│   │   └── artifacts/                                                   │
+│   │       └── issues/                                                  │
+│   │           └── issue-42.md                                          │
+│   ├── packages/                                                             │
+│   └── ...                                                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Quick Reference: Common Interactions
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   WHAT YOU WANT                     WHAT TO SAY (Platform/CLI)          │
+│                                                                         │
+│   Run workflow locally              bun run cli workflow run <name>     │
+│   List CLI workflows                bun run cli workflow list           │
+│   Fix a GitHub issue                "@archon fix this issue"            │
+│   Review a PR                       "@archon review this PR"            │
+│   Ask a question                    "What does handleMessage do?"       │
+│   Resolve conflicts                 "@archon resolve the conflicts"     │
+│   See current state                 "/status"                           │
+│   Clone a repo                      "/clone https://github.com/u/r"     │
+│   Switch repos                      "/repos" then pick one              │
+│   List available workflows          "/workflow list"                    │
+│   Reload workflow definitions       "/workflow reload"                  │
+│   Approve paused workflow           "/workflow approve <id> [comment]"  │
+│   Reject paused workflow           "/workflow reject <id> [reason]"   │
+│   Cancel stuck workflow             "/workflow cancel"                  │
+│   Start fresh                       "/reset"                            │
+│   Get help                          "/help"                             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   ARCHON = Remote Control for AI Coding Assistants                     │
+│                                                                         │
+│   ┌────────────────────────────────────────────────────────────────┐   │
+│   │                                                                │   │
+│   │   Phone/Slack/GitHub ──▶ Archon Server ──▶ AI (Claude/Codex)  │   │
+│   │                              │                    │            │   │
+│   │                              ▼                    ▼            │   │
+│   │                         Workflows           Git Worktrees      │   │
+│   │                        (automation)         (isolation)        │   │
+│   │                                                                │   │
+│   └────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│   KEY CAPABILITIES:                                                    │
+│   ─────────────────                                                    │
+│   ✓ Message from anywhere (phone, tablet, desktop)                    │
+│   ✓ Automated multi-step workflows                                    │
+│   ✓ Parallel AI agents for complex tasks                              │
+│   ✓ Isolated environments per conversation                            │
+│   ✓ Custom prompts versioned in Git                                   │
+│   ✓ GitHub integration (issues/PRs/comments)                          │
+│                                                                         │
+│   WHEN TO USE:                                                         │
+│   ─────────────                                                        │
+│   ✓ You want to fix bugs from your phone                              │
+│   ✓ You want automated PR reviews                                     │
+│   ✓ You want GitHub issue automation                                  │
+│   ✓ You want parallel development without conflicts                   │
+│   ✓ You want custom AI workflows for your team                        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Next Steps
+
+1. **Read**: [Quickstart](/getting-started/quick-start/) - Set up your first instance
+2. **Explore**: `.archon/workflows/` - See example workflows
+3. **Customize**: `.archon/commands/` - Create your own prompts
+4. **Configure**: `.archon/config.yaml` - Tweak settings
+
+Welcome to remote agentic coding!

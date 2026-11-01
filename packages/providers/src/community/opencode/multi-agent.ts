@@ -1,0 +1,423 @@
+import { createLogger } from '@archon/paths';
+import { sessionPreview } from '@archon/provider-contract';
+
+import { mergeTokenUsage } from '../../types';
+import type { MessageChunk, SendQueryOptions, TokenUsage } from '../../types';
+import { getOrderedAgents, type NamedAgentConfig } from './agent-config';
+import { errorMessage, pendingPermissionError } from './errors';
+import type { OpencodeClientLike } from './runtime';
+import {
+  abortableStream,
+  createSessionPromptBody,
+  promptSession,
+  resolveSessionId,
+  TextPartBlocks,
+  toolPartEvents,
+} from './session';
+import { sumAssistantUsage } from './tokens';
+
+interface ProviderModel {
+  providerID: string;
+  modelID: string;
+}
+
+interface AgentRunState {
+  agent: NamedAgentConfig;
+  cwd: string;
+  sessionId: string;
+  chunks: MessageChunk[];
+  textBlocks: TextPartBlocks;
+  /** Latest update of each assistant message, keyed by message id. */
+  assistantInfos: Map<string, Record<string, unknown>>;
+  lastAssistantMessageId?: string;
+  done: boolean;
+}
+
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('provider.opencode');
+  return cachedLog;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+async function readStructuredOutput(
+  client: OpencodeClientLike,
+  cwd: string,
+  sessionId: string,
+  messageId: string | undefined
+): Promise<unknown> {
+  if (!messageId) return undefined;
+  try {
+    const response = await client.session.message({
+      path: { id: sessionId, messageID: messageId },
+      query: { directory: cwd },
+    });
+    const info = response.data?.info;
+    if (isRecord(info) && 'structured_output' in info) {
+      return info.structured_output;
+    }
+  } catch (error) {
+    getLog().warn(
+      { err: error, sessionIdPreview: sessionPreview(sessionId), messageId },
+      'opencode.structured_output_lookup_failed'
+    );
+  }
+  return undefined;
+}
+
+function withAgentNodeConfig(
+  requestOptions: SendQueryOptions | undefined,
+  agent: NamedAgentConfig
+): SendQueryOptions | undefined {
+  if (!requestOptions) {
+    return {
+      nodeConfig: {
+        agents: { [agent.key]: agent.config },
+      },
+    };
+  }
+  return {
+    ...requestOptions,
+    nodeConfig: {
+      ...(requestOptions.nodeConfig ?? {}),
+      agents: { [agent.key]: agent.config },
+    },
+  };
+}
+
+function formatBufferedAssistantOutput(states: AgentRunState[]): string {
+  return states
+    .map(state => {
+      const assistantText = state.chunks
+        .filter(
+          (chunk): chunk is Extract<MessageChunk, { type: 'agent_message_chunk' }> =>
+            chunk.type === 'agent_message_chunk'
+        )
+        .map(chunk => chunk.text)
+        .join('');
+      const thinkingText = state.chunks
+        .filter(
+          (chunk): chunk is Extract<MessageChunk, { type: 'agent_thought_chunk' }> =>
+            chunk.type === 'agent_thought_chunk'
+        )
+        .map(chunk => chunk.text)
+        .join('');
+      const sections: string[] = [`## ${state.agent.key}`];
+      if (thinkingText) {
+        sections.push(`<thinking>\n${thinkingText}\n</thinking>`);
+      }
+      sections.push(assistantText || '(no output)');
+      return sections.join('\n\n');
+    })
+    .join('\n\n---\n\n');
+}
+
+function collectToolChunksForEmission(states: AgentRunState[]): MessageChunk[] {
+  return states.flatMap(state =>
+    state.chunks.filter(chunk => chunk.type === 'tool_call' || chunk.type === 'tool_call_update')
+  );
+}
+
+export async function* streamMultiAgentOpencodeSession(
+  client: OpencodeClientLike,
+  cwd: string,
+  nodeId: string,
+  prompt: string,
+  model: ProviderModel,
+  requestOptions: SendQueryOptions | undefined
+): AsyncGenerator<MessageChunk> {
+  const agents = getOrderedAgents(requestOptions?.nodeConfig);
+  if (agents.length <= 1) {
+    throw new Error('streamMultiAgentOpencodeSession requires multiple agents');
+  }
+
+  getLog().info({ nodeId, agentCount: agents.length, cwd }, 'opencode.multi_agent_starting');
+
+  requestOptions?.abortSignal?.throwIfAborted();
+  const events = await client.event.subscribe({ query: { directory: cwd } });
+  requestOptions?.abortSignal?.throwIfAborted();
+  getLog().info({ nodeId }, 'opencode.multi_agent_events_subscribed');
+  const streamController = new AbortController();
+  const sessionToAgent = new Map<string, AgentRunState>();
+  let aborted = requestOptions?.abortSignal?.aborted === true;
+
+  const abortAll = async (): Promise<void> => {
+    await Promise.all(
+      Array.from(sessionToAgent.values()).map(state =>
+        client.session
+          .abort({ path: { id: state.sessionId }, query: { directory: state.cwd } })
+          .catch(error => {
+            getLog().debug(
+              {
+                err: error,
+                sessionIdPreview: sessionPreview(state.sessionId),
+                agent: state.agent.key,
+              },
+              'opencode.multi_agent_abort_failed'
+            );
+          })
+      )
+    );
+  };
+
+  const abortHandler = (): void => {
+    aborted = true;
+    void abortAll();
+    streamController.abort();
+  };
+
+  requestOptions?.abortSignal?.addEventListener('abort', abortHandler, { once: true });
+
+  try {
+    // Phase 1: Create all child sessions in the shared sessionCwd so a single
+    // event subscription receives events from every child session.
+    getLog().info({ nodeId }, 'opencode.multi_agent_creating_sessions');
+    const states = await Promise.all(
+      agents.map(async agent => {
+        const { sessionId } = await resolveSessionId(client, cwd, undefined);
+        getLog().info(
+          { agent: agent.key, sessionIdPreview: sessionPreview(sessionId), cwd },
+          'opencode.multi_agent_session_created'
+        );
+        const state: AgentRunState = {
+          agent,
+          cwd,
+          sessionId,
+          chunks: [],
+          textBlocks: new TextPartBlocks(),
+          assistantInfos: new Map(),
+          done: false,
+        };
+        sessionToAgent.set(sessionId, state);
+        return state;
+      })
+    );
+
+    requestOptions?.abortSignal?.throwIfAborted();
+
+    // Phase 2: Fire all prompts in parallel
+    getLog().info({ nodeId, sessionCount: states.length }, 'opencode.multi_agent_prompting');
+    await Promise.all(
+      states.map(async state => {
+        requestOptions?.abortSignal?.throwIfAborted();
+        const agentRequestOptions = withAgentNodeConfig(requestOptions, state.agent);
+        const promptBody = createSessionPromptBody(prompt, model, agentRequestOptions, state.agent);
+        getLog().info(
+          { agent: state.agent.key, sessionIdPreview: sessionPreview(state.sessionId) },
+          'opencode.multi_agent_prompt_sending'
+        );
+        await promptSession(client, cwd, state.sessionId, promptBody);
+        getLog().info(
+          { agent: state.agent.key, sessionIdPreview: sessionPreview(state.sessionId) },
+          'opencode.multi_agent_prompt_sent'
+        );
+      })
+    );
+    getLog().info({ nodeId }, 'opencode.multi_agent_all_prompts_sent');
+
+    const seenToolCalls = new Set<string>();
+    const completedToolCalls = new Set<string>();
+
+    // Phase 3: Listen to events and demux by sessionID
+    getLog().info({ nodeId }, 'opencode.multi_agent_listening');
+    let eventCount = 0;
+    for await (const rawEvent of abortableStream(events.stream, streamController.signal)) {
+      eventCount++;
+      if (eventCount <= 5) {
+        getLog().info(
+          { nodeId, eventCount, eventType: (rawEvent as { type?: string })?.type },
+          'opencode.multi_agent_event_received'
+        );
+      }
+      const event = rawEvent as {
+        type?: string;
+        properties?: Record<string, unknown>;
+      };
+      const properties = isRecord(event.properties) ? event.properties : {};
+
+      if (event.type === 'message.updated') {
+        const info = isRecord(properties.info) ? properties.info : undefined;
+        const sessionId = typeof info?.sessionID === 'string' ? info.sessionID : undefined;
+        const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
+        if (!state || info?.role !== 'assistant') continue;
+        if (typeof info.id === 'string') {
+          state.lastAssistantMessageId = info.id;
+          state.assistantInfos.set(info.id, info);
+        }
+        continue;
+      }
+
+      if (event.type === 'message.part.updated') {
+        const part = isRecord(properties.part) ? properties.part : undefined;
+        const sessionId = typeof part?.sessionID === 'string' ? part.sessionID : undefined;
+        const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
+        if (!state || typeof part?.type !== 'string') continue;
+
+        if (part.type === 'text' || part.type === 'reasoning') {
+          const delta = typeof properties.delta === 'string' ? properties.delta : undefined;
+          const block = state.textBlocks.update(part, delta);
+          if (block) state.chunks.push(block);
+          continue;
+        }
+
+        if (part.type === 'tool' && typeof part.callID === 'string') {
+          // Scoped by agent: each agent's session numbers its own calls.
+          state.chunks.push(
+            ...toolPartEvents(
+              part,
+              `${state.agent.key}:${part.callID}`,
+              seenToolCalls,
+              completedToolCalls
+            )
+          );
+        }
+        continue;
+      }
+
+      if (event.type === 'session.error') {
+        const sessionId =
+          typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
+        const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
+        if (!state) continue;
+        await abortAll();
+        const rawError = isRecord(properties.error) ? properties.error : properties;
+        const err = new Error(`[${state.agent.key}] ${errorMessage(rawError)}`);
+        err.cause = rawError;
+        throw err;
+      }
+
+      // Same safety net as session.ts: the embedded server sets no
+      // `permission` policy of its own, so this can fire for any child
+      // session whenever the user's own OpenCode config (or an upstream
+      // default such as `doom_loop`/`external_directory`) leaves a category
+      // as `ask`. `properties` for this event is the pending-permission
+      // record itself, whose `sessionID` field scopes it to one child
+      // agent's session the same way `message.updated`/`message.part.updated`
+      // demux above (issue #3332). The real event is `permission.asked`, not
+      // the `permission.updated` name the `@opencode-ai/sdk` npm package's
+      // types declare — verified against a live server's
+      // `EventPermissionAsked` schema (`GET /doc`); the pinned SDK's types
+      // are stale for this event.
+      if (event.type === 'permission.asked') {
+        const sessionId =
+          typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
+        const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
+        if (!state) continue;
+        await abortAll();
+        throw pendingPermissionError(properties);
+      }
+
+      if (event.type === 'session.idle') {
+        const sessionId =
+          typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
+        const state = sessionId ? sessionToAgent.get(sessionId) : undefined;
+        if (!state) continue;
+        state.done = true;
+        state.chunks.push(...state.textBlocks.drain());
+        getLog().info(
+          {
+            nodeId,
+            agent: state.agent.key,
+            sessionIdPreview: sessionPreview(state.sessionId),
+            doneCount: states.filter(s => s.done).length,
+            totalCount: states.length,
+          },
+          'opencode.multi_agent_session_idle'
+        );
+
+        // Check if all agents are done
+        if (states.every(candidate => candidate.done)) {
+          // Emit collected tool chunks first
+          const toolChunks = collectToolChunksForEmission(states);
+          for (const chunk of toolChunks) {
+            yield chunk;
+          }
+
+          // Emit combined assistant output
+          yield {
+            type: 'agent_message_chunk',
+            text: formatBufferedAssistantOutput(states),
+          };
+
+          // Aggregate tokens across sub-agents. The cache axes follow the shared floor
+          // rule (#2662): one sub-agent without cache telemetry narrows the total and
+          // flags it, instead of erasing cache the others did report. A total is only
+          // available when every sub-agent reported every component needed to compute it.
+          const assistantUsages = states.map(candidate =>
+            sumAssistantUsage([...candidate.assistantInfos.values()])
+          );
+          const perAgentUsage = assistantUsages
+            .map(usage => usage.tokens)
+            .filter((usage): usage is TokenUsage => usage !== undefined);
+          const mergedUsage = mergeTokenUsage(perAgentUsage);
+          const costs = assistantUsages.flatMap(usage =>
+            usage.cost !== undefined ? [usage.cost] : []
+          );
+          const cost = costs.length > 0 ? costs.reduce((sum, value) => sum + value, 0) : undefined;
+          const totals = perAgentUsage
+            .map(usage => usage.total)
+            .filter((total): total is number => total !== undefined);
+          const totalComplete =
+            perAgentUsage.length === states.length && totals.length === perAgentUsage.length;
+          const tokens: TokenUsage | undefined =
+            // A lone reported usage otherwise passes through verbatim; merging it would
+            // synthesize fields and change what a single-agent turn reports.
+            perAgentUsage.length === 1
+              ? { ...perAgentUsage[0] }
+              : mergedUsage && {
+                  ...mergedUsage,
+                  ...(cost !== undefined ? { cost } : {}),
+                };
+          if (tokens) {
+            if (totalComplete) tokens.total = totals.reduce((sum, total) => sum + total, 0);
+            else delete tokens.total;
+          }
+
+          // Fetch structured outputs from all agents
+          const structuredOutputs = await Promise.all(
+            states.map(async state => {
+              const output = await readStructuredOutput(
+                client,
+                state.cwd,
+                state.sessionId,
+                state.lastAssistantMessageId
+              );
+              return output !== undefined ? ([state.agent.key, output] as const) : undefined;
+            })
+          ).then(results => {
+            const filtered = results.filter(entry => entry !== undefined) as [string, unknown][];
+            return filtered.length > 0 ? Object.fromEntries(filtered) : undefined;
+          });
+
+          // Multi-agent runs span multiple sessions; there is no single canonical
+          // sessionId to resume, so we omit it rather than returning an arbitrary one.
+          yield {
+            type: 'result',
+            ...(tokens ? { tokens } : {}),
+            ...(cost !== undefined ? { cost } : {}),
+            ...(structuredOutputs ? { structuredOutput: structuredOutputs } : {}),
+          };
+          getLog().info({ nodeId }, 'opencode.multi_agent_completed');
+          return;
+        }
+      }
+    }
+
+    getLog().info({ nodeId, aborted, eventCount }, 'opencode.multi_agent_loop_exited');
+    if (aborted) {
+      const abortReason = requestOptions?.abortSignal?.reason;
+      throw new Error(
+        `OpenCode query aborted (nodeId: ${nodeId}, agents: ${agents.length}, cwd: ${cwd})` +
+          (abortReason ? `: ${String(abortReason)}` : '')
+      );
+    }
+    throw new Error('OpenCode multi-agent stream ended before all agents completed');
+  } finally {
+    requestOptions?.abortSignal?.removeEventListener('abort', abortHandler);
+    streamController.abort();
+  }
+}

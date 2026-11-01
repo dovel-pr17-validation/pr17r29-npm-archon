@@ -1,0 +1,197 @@
+/**
+ * Request-shape tests for startRun's declared-inputs channel (#2554).
+ *
+ * The JSON and multipart branches carry the same map two different ways, and the
+ * multipart encoding has to agree byte-for-byte with what the run route's multipart
+ * branch parses — a disagreement there is invisible until a real run silently starts
+ * without its inputs.
+ */
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { HttpError } from '../lib/http';
+import { startRun } from './startRun';
+
+interface Captured {
+  url: string;
+  init: RequestInit | undefined;
+}
+
+const originalFetch = globalThis.fetch;
+const originalWindow = globalThis.window;
+let calls: Captured[] = [];
+
+function stubFetch(
+  runStatus = 200,
+  runPayload: object = { accepted: true, status: 'started' }
+): void {
+  calls = [];
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    calls.push({ url, init });
+    const payload = url.includes('/api/conversations')
+      ? { conversationId: 'web-test-1' }
+      : runPayload;
+    return Promise.resolve(
+      new Response(JSON.stringify(payload), {
+        status: url.includes('/api/conversations') ? 200 : runStatus,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+  }) as typeof fetch;
+}
+
+/** The run dispatch is the second call; the first creates the conversation. */
+function runCall(): Captured {
+  const call = calls.find(c => c.url.includes('/run'));
+  if (call === undefined) throw new Error('no run dispatch captured');
+  return call;
+}
+
+describe('startRun — declared inputs (#2554)', () => {
+  beforeEach(() => {
+    stubFetch();
+    globalThis.window = { location: { origin: 'http://localhost' } } as Window & typeof globalThis;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    globalThis.window = originalWindow;
+  });
+
+  test('JSON branch carries `inputs` alongside the message', async () => {
+    await startRun({
+      projectId: 'p1',
+      workflow: 'review-block',
+      message: 'go',
+      inputs: { diff: 'D1', style: 'terse' },
+    });
+
+    const body = JSON.parse(String(runCall().init?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      conversationId: 'web-test-1',
+      message: 'go',
+      inputs: { diff: 'D1', style: 'terse' },
+    });
+  });
+
+  test('JSON branch omits `inputs` entirely when none are supplied', async () => {
+    await startRun({ projectId: 'p1', workflow: 'plain', message: 'go' });
+
+    const body = JSON.parse(String(runCall().init?.body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('inputs');
+  });
+
+  test('JSON branch omits `inputs` for an empty map rather than sending {}', async () => {
+    await startRun({ projectId: 'p1', workflow: 'plain', message: 'go', inputs: {} });
+
+    const body = JSON.parse(String(runCall().init?.body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('inputs');
+  });
+
+  test('multipart branch carries `inputs` as one JSON-encoded form field', async () => {
+    // A form field can only be a string — this is the encoding the run route's
+    // multipart branch JSON.parses back.
+    await startRun({
+      projectId: 'p1',
+      workflow: 'review-block',
+      message: 'go',
+      files: [new File(['x'], 'a.txt', { type: 'text/plain' })],
+      inputs: { diff: 'D1' },
+    });
+
+    const form = runCall().init?.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(JSON.parse(String(form.get('inputs')))).toEqual({ diff: 'D1' });
+    expect(form.get('message')).toBe('go');
+    expect(form.getAll('files')).toHaveLength(1);
+    expect(new Headers(runCall().init?.headers).has('Content-Type')).toBe(false);
+  });
+
+  test('multipart branch omits the `inputs` field when none are supplied', async () => {
+    await startRun({
+      projectId: 'p1',
+      workflow: 'plain',
+      message: 'go',
+      files: [new File(['x'], 'a.txt', { type: 'text/plain' })],
+    });
+
+    const form = runCall().init?.body as FormData;
+    expect(form.get('inputs')).toBeNull();
+  });
+
+  test('JSON branch carries sparse tier and alias bindings', async () => {
+    await startRun({
+      projectId: 'p1',
+      workflow: 'bench',
+      message: 'go',
+      tiers: { large: 'openai/gpt-5.6' },
+      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    });
+
+    const body = JSON.parse(String(runCall().init?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      tiers: { large: 'openai/gpt-5.6' },
+      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    });
+  });
+
+  test('multipart branch JSON-encodes sparse tier and alias bindings', async () => {
+    await startRun({
+      projectId: 'p1',
+      workflow: 'bench',
+      message: 'go',
+      files: [new File(['x'], 'a.txt', { type: 'text/plain' })],
+      tiers: { large: 'openai/gpt-5.6' },
+      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    });
+
+    const form = runCall().init?.body as FormData;
+    expect(JSON.parse(String(form.get('tiers')))).toEqual({ large: 'openai/gpt-5.6' });
+    expect(JSON.parse(String(form.get('aliases')))).toEqual({
+      '@planner': 'codex/gpt-5.6-sol',
+    });
+  });
+  for (const attached of [false, true]) {
+    test(`launch preserves the full server refusal (attached: ${String(attached)})`, async () => {
+      const message = `Launch refused: ${'credential preflight detail; '.repeat(12)}TAIL-MUST-BE-VISIBLE`;
+      stubFetch(409, { error: message });
+
+      const launch = startRun({
+        projectId: 'p1',
+        workflow: 'review-block',
+        message: 'go',
+        files: attached ? [new File(['x'], 'a.txt', { type: 'text/plain' })] : undefined,
+      });
+
+      await expect(launch).rejects.toBeInstanceOf(HttpError);
+      await expect(launch).rejects.toMatchObject({
+        status: 409,
+        path: '/api/workflows/review-block/run',
+        bodySnippet: `${JSON.stringify({ error: message }).slice(0, 200)}...`,
+        serverError: message,
+      });
+    });
+
+    test(`launch caps a proxy HTML refusal (attached: ${String(attached)})`, async () => {
+      const html = `<html><body>${'Bad gateway '.repeat(40)}</body></html>`;
+      globalThis.fetch = ((input: RequestInfo | URL) =>
+        Promise.resolve(
+          String(input).includes('/api/conversations')
+            ? Response.json({ conversationId: 'web-test-1' })
+            : new Response(html, { status: 502 })
+        )) as typeof fetch;
+
+      await expect(
+        startRun({
+          projectId: 'p1',
+          workflow: 'review-block',
+          message: 'go',
+          files: attached ? [new File(['x'], 'a.txt')] : undefined,
+        })
+      ).rejects.toMatchObject({
+        status: 502,
+        bodySnippet: `${html.slice(0, 200)}...`,
+        serverError: undefined,
+      });
+    });
+  }
+});

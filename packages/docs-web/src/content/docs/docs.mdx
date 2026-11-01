@@ -1,0 +1,55 @@
+---
+title: Archon
+description: The simplest way to build the software that builds your software. YAML workflows that can do anything.
+template: splash
+hero:
+  title: Archon
+  image:
+    file: ../../assets/logo.png
+    alt: Archon Logo
+  tagline: The simplest way to build the software that builds your software. YAML workflows that can do anything.
+  actions:
+    - text: Quickstart
+      link: /getting-started/quick-start/
+      icon: right-arrow
+      variant: primary
+    - text: Why Archon
+      link: /getting-started/why-archon/
+      icon: right-arrow
+      variant: secondary
+    - text: View on GitHub
+      link: https://github.com/coleam00/Archon
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Archon is a factory builder. You describe how work should get done as YAML workflows, and Archon runs them with AI agents, scripts and your decisions in the places that need them. Software is the first factory: the bundled `sdlc` pack takes an issue to a merged pull request. The same engine runs any process you can describe.
+
+Take yourself out of the loop and sit on top of it.
+
+<CardGrid>
+  <Card title="Workflows you own" icon="document">
+    The workflow fixes the steps, checks and gates. The agent supplies judgment inside each step.
+  </Card>
+  <Card title="Queues and attention" icon="list-format">
+    Queues move work forward on their own. A run comes to you only when it needs a decision you own.
+  </Card>
+  <Card title="A reliable core, open at the seams" icon="puzzle">
+    Providers, forges, chat platforms and workflow packs are plugins. Build your own for anything.
+  </Card>
+  <Card title="Your agents, self-hosted" icon="laptop">
+    Runs Claude Code, Codex and Pi on the subscriptions you have. Every run is logged in your own database.
+  </Card>
+</CardGrid>
+
+## Install
+
+```bash
+curl -fsSL https://archon.diy/install | bash        # macOS / Linux
+irm https://archon.diy/install.ps1 | iex             # Windows (PowerShell)
+brew install coleam00/archon/archon                 # Homebrew, then: archon setup
+```
+
+Then follow the [Quickstart](/getting-started/quick-start/) to run your first workflow, or read [Installation](/getting-started/installation/) for Docker and source installs.

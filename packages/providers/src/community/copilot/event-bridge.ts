@@ -1,0 +1,495 @@
+/**
+ * Event bridge between @github/copilot-sdk's callback-based session.on() API
+ * and Archon's async-generator MessageChunk contract.
+ *
+ * Three concerns in this file:
+ *  1. `AsyncQueue<T>` — single-producer / single-consumer queue; copied
+ *     verbatim from `community/pi/event-bridge.ts`. Peer community providers
+ *     stay decoupled (no cross-imports).
+ *  2. `mapCopilotEvent(event, ctx)` — pure fn
+ *     translating one SDK event into zero or more MessageChunks. Testable
+ *     in isolation.
+ *  3. `bridgeSession(session, prompt, abortSignal?)` — wired integration
+ *     wrapper; lives here rather than in provider.ts so the queue/listener/
+ *     cleanup lifecycle stays readable.
+ *
+ * Module-scope invariant: type-only imports from @github/copilot-sdk. Value
+ * imports go inside `provider.ts` via dynamic `await import(...)`. See the
+ * PI lazy-load test for rationale.
+ */
+import { createLogger } from '@archon/paths';
+import type {
+  AssistantMessageEvent,
+  CopilotSession,
+  SessionEvent,
+  ToolExecutionCompleteData,
+} from '@github/copilot-sdk';
+
+import { sessionPreview, truncateToolOutput } from '@archon/provider-contract';
+
+import type { MessageChunk, TokenUsage } from '../../types';
+import { tryParseStructuredOutput } from '../../shared/structured-output';
+
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('provider.copilot.event-bridge');
+  return cachedLog;
+}
+
+// ─── AsyncQueue ──────────────────────────────────────────────────────────
+
+/**
+ * Single-producer / single-consumer async queue. Bridges the SDK's
+ * callback-based `session.on()` into an async generator.
+ *
+ * Design:
+ *  - producers call `push(item)` from any synchronous context
+ *  - the consumer awaits `for await (const item of queue)` ONCE
+ *  - sentinel items (in this bridge: `done` / `error`) are pushed by the
+ *    caller; the queue itself does not know about them
+ *
+ * Single-consumer is a hard invariant — a second iterator would race with
+ * the first over both the buffer and the waiters list, silently dropping
+ * items. Constructor enforces: first `Symbol.asyncIterator` sets
+ * `consumed=true`; subsequent calls throw loudly during development.
+ */
+export class AsyncQueue<T> implements AsyncIterable<T> {
+  private readonly buffer: T[] = [];
+  private readonly waiters: ((result: IteratorResult<T>) => void)[] = [];
+  private consumed = false;
+  private closed = false;
+
+  push(item: T): void {
+    if (this.closed) return;
+    const waiter = this.waiters.shift();
+    if (waiter) waiter({ value: item, done: false });
+    else this.buffer.push(item);
+  }
+
+  /**
+   * Terminate iteration cleanly. Drains any pending waiters with
+   * `{ done: true }` so the consumer exits the `for await` loop instead of
+   * hanging when the producer's finally block fires before a new item
+   * arrives (e.g. consumer abort mid-iteration).
+   */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    while (this.waiters.length > 0) {
+      const waiter = this.waiters.shift();
+      if (waiter) waiter({ value: undefined, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    if (this.consumed) {
+      throw new Error(
+        'AsyncQueue: a single queue can only be iterated once (single-consumer invariant). Create a new queue for each consumer.'
+      );
+    }
+    this.consumed = true;
+    return this.iterate();
+  }
+
+  private async *iterate(): AsyncGenerator<T> {
+    while (true) {
+      const next = this.buffer.shift();
+      if (next !== undefined) {
+        yield next;
+        continue;
+      }
+      if (this.closed) return;
+      const result = await new Promise<IteratorResult<T>>(resolve => {
+        this.waiters.push(resolve);
+      });
+      if (result.done) return;
+      yield result.value;
+    }
+  }
+}
+
+// ─── Usage + event → chunk translation ────────────────────────────────────
+
+/**
+ * Coerce the SDK's `assistant.usage.data` shape into Archon's TokenUsage.
+ * Returns undefined unless both required token counts are numbers.
+ */
+export function normalizeCopilotUsage(raw?: {
+  inputTokens?: number;
+  outputTokens?: number;
+}): TokenUsage | undefined {
+  if (!raw) return undefined;
+  const input = raw.inputTokens;
+  const output = raw.outputTokens;
+  if (typeof input !== 'number' || typeof output !== 'number') return undefined;
+  return { input, output };
+}
+
+/**
+ * Compose the text of a failed tool result. The SDK may carry the failure in
+ * `result.content` / `result.detailedContent`, in `error.message`, or in
+ * both; a failure with only `error` and no `result` is valid, so `rawOutput`
+ * alone would drop the explanation. Lead with the message and keep the
+ * output when it adds detail, skipping the message when the output already
+ * contains it verbatim so the same sentence isn't printed twice.
+ */
+function formatToolFailure(rawOutput: string, error: ToolExecutionCompleteData['error']): string {
+  const message = error?.message ?? '';
+  if (!message) return rawOutput;
+  if (!rawOutput) return message;
+  if (rawOutput.includes(message)) return rawOutput;
+  return `${message}\n${rawOutput}`;
+}
+
+/**
+ * Side-effect callbacks the mapper calls into closure state. Splitting them from
+ * the pure return value lets the test table drive the MessageChunk output while
+ * spies verify the closure interactions.
+ */
+export interface EventMapperContext {
+  /** Called when assistant.usage arrives; undefined for non-usage events. */
+  captureUsage: (usage: TokenUsage) => void;
+  /** Flagged on session.error; consumer decides whether to promote to isError on the terminal result. */
+  markErrored: (errorMsg: string) => void;
+}
+
+type CopilotMcpStatus = Extract<
+  SessionEvent,
+  { type: 'session.mcp_server_status_changed' }
+>['data']['status'];
+type McpServerStatusChunk = Extract<MessageChunk, { type: 'mcp_server_status' }>;
+
+const MCP_STATUS = {
+  connected: 'connected',
+  failed: 'failed',
+  'needs-auth': 'needs_auth',
+  pending: 'pending',
+  disabled: 'disabled',
+  stopped: 'disabled',
+  // A server the session did not configure is unavailable to it.
+  not_configured: 'failed',
+} as const satisfies Record<CopilotMcpStatus, McpServerStatusChunk['status']>;
+
+function mcpServerStatusOf(
+  server: string,
+  status: CopilotMcpStatus,
+  error: string | undefined
+): McpServerStatusChunk {
+  return {
+    type: 'mcp_server_status',
+    server,
+    status: MCP_STATUS[status],
+    ...(error !== undefined ? { error } : {}),
+  };
+}
+
+/**
+ * Translate one Copilot SDK `SessionEvent` into zero or more Archon
+ * `MessageChunk`s, mutating the supplied context (captured usage, terminal
+ * error) as a side-effect.
+ *
+ * Text and reasoning map from the whole `assistant.message` /
+ * `assistant.reasoning` events: the contract carries one chunk per block, and
+ * those events are the SDK's block boundaries. Their `*_delta` events are not
+ * mapped.
+ *
+ * Events intentionally NOT mapped:
+ *   - `user.message` — echo of our own prompt
+ *   - `session.idle` — internal signal; sendAndWait resolves on it
+ *   - turn_start/turn_end, streaming_delta, intent, task_complete,
+ *     context_changed, title_changed, etc. — internal housekeeping
+ */
+export function mapCopilotEvent(event: SessionEvent, ctx: EventMapperContext): MessageChunk[] {
+  switch (event.type) {
+    case 'assistant.message': {
+      const text = event.data.content;
+      return text ? [{ type: 'agent_message_chunk', text }] : [];
+    }
+    case 'assistant.reasoning': {
+      const text = event.data.content;
+      return text ? [{ type: 'agent_thought_chunk', text }] : [];
+    }
+    case 'assistant.usage': {
+      const usage = normalizeCopilotUsage(event.data);
+      if (usage) ctx.captureUsage(usage);
+      return [];
+    }
+    case 'tool.execution_start': {
+      const { toolCallId, toolName, arguments: args } = event.data;
+      const call: MessageChunk = { type: 'tool_call', toolCallId, name: toolName };
+      if (args !== undefined) call.rawInput = args;
+      return [call];
+    }
+    case 'tool.execution_complete': {
+      const { toolCallId, success, result, error } = event.data;
+      // Prefer detailedContent (full output) over content (truncated for LLM).
+      const rawOutput = result?.detailedContent ?? result?.content ?? '';
+      return [
+        {
+          type: 'tool_call_update',
+          toolCallId,
+          status: success ? 'completed' : 'failed',
+          ...truncateToolOutput(success ? rawOutput : formatToolFailure(rawOutput, error)),
+        },
+      ];
+    }
+    case 'session.error': {
+      // Don't emit a warning here — defer until after sendAndWait resolves. If
+      // the SDK delivers a fallback assistant message (transient upstream errors
+      // are common on auto-retry paths), the user got what they asked for and a
+      // warning is just noise. The bridgeSession wrapper checks
+      // `sawAssistantContent` and emits the warning only when no assistant
+      // content reached the consumer.
+      const msg = event.data.message || 'Copilot session error';
+      ctx.markErrored(msg);
+      return [];
+    }
+    case 'session.mcp_server_status_changed': {
+      const { serverName, status, error } = event.data;
+      return [mcpServerStatusOf(serverName, status, error)];
+    }
+    case 'session.mcp_servers_loaded':
+      return event.data.servers.map(server =>
+        mcpServerStatusOf(server.name, server.status, server.error)
+      );
+    case 'session.compaction_start':
+      return [{ type: 'compaction', phase: 'started' }];
+    case 'session.compaction_complete': {
+      const { error, preCompactionTokens, postCompactionTokens } = event.data;
+      if (error) {
+        getLog().warn({ error }, 'copilot.compaction_failed');
+        return [];
+      }
+      const completed: MessageChunk = { type: 'compaction', phase: 'completed' };
+      if (preCompactionTokens !== undefined) completed.tokensBefore = preCompactionTokens;
+      if (postCompactionTokens !== undefined) completed.tokensAfter = postCompactionTokens;
+      return [completed];
+    }
+    default: {
+      getLog().debug({ eventType: event.type }, 'copilot.unhandled_event_type');
+      return [];
+    }
+  }
+}
+
+// ─── bridgeSession integration wrapper ────────────────────────────────────
+
+/**
+ * Backstop timeout passed to `session.sendAndWait()`.
+ *
+ * The SDK defaults to 60s, which is far too short — any tool-heavy turn or
+ * workflow node with a larger `idle_timeout` would trip the SDK timer before
+ * Archon's own idle / abort machinery gets a say. The SDK docs also note
+ * that this timeout *only* stops the wait; it does not abort in-flight agent
+ * work — so a small value causes the session to keep running in the
+ * background, orphaned. We therefore set a 60-minute ceiling (2× Archon's
+ * `STEP_IDLE_TIMEOUT_MS`) and rely on `abortSignal → session.abort()` to be
+ * the real cancel path.
+ */
+const SEND_AND_WAIT_TIMEOUT_MS = 60 * 60 * 1000;
+
+export type BridgeQueueItem =
+  | { kind: 'chunk'; chunk: MessageChunk }
+  | { kind: 'done' }
+  | { kind: 'error'; error: Error };
+
+/**
+ * Bridge a CopilotSession into an async generator of MessageChunks.
+ *
+ * Lifecycle:
+ *  1. Subscribe to the session's event stream. Each event is translated via
+ *     `mapCopilotEvent` and pushed into an `AsyncQueue`. Listener-thrown
+ *     errors are captured and pushed as `{ kind: 'error' }` so the consumer
+ *     surfaces them instead of swallowing.
+ *  2. Wire `abortSignal` to `session.abort()`. Fire-and-forget — the SDK
+ *     will surface the resulting rejection through `sendAndWait`, which
+ *     feeds the queue.
+ *  3. Call `session.sendAndWait({ prompt })` in parallel. Resolution pushes
+ *     `{ kind: 'done' }`; rejection pushes `{ kind: 'error' }`. Its return
+ *     value is stashed as a safety net for the no-streaming-deltas case.
+ *  4. Consume the queue, yielding chunks. On `done`, emit a terminal
+ *     `{ type: 'result', sessionId, tokens?, isError? }` chunk. Tokens are
+ *     captured via the `assistant.usage` event earlier in the stream.
+ *  5. Finally: close the queue, unsubscribe, remove abort listener, call
+ *     `session.disconnect()` (best-effort), and await the sendAndWait
+ *     promise to let the SDK settle (errors already surfaced via queue).
+ */
+export async function* bridgeSession(
+  session: CopilotSession,
+  prompt: string,
+  abortSignal?: AbortSignal,
+  jsonSchema?: Record<string, unknown>
+): AsyncGenerator<MessageChunk> {
+  const log = getLog();
+  const queue = new AsyncQueue<BridgeQueueItem>();
+  let capturedTokens: TokenUsage | undefined;
+  let errorMessage: string | undefined;
+
+  // Structured-output buffer. Populated only when the caller supplied a
+  // schema; parsed into the terminal result chunk after the run completes.
+  const wantsStructured = jsonSchema !== undefined;
+  let assistantBuffer = '';
+
+  const ctx: EventMapperContext = {
+    captureUsage: (u: TokenUsage): void => {
+      capturedTokens = u;
+    },
+    markErrored: (msg: string): void => {
+      errorMessage = msg;
+    },
+  };
+
+  const unsubscribe = session.on((event: SessionEvent) => {
+    try {
+      const chunks = mapCopilotEvent(event, ctx);
+      for (const chunk of chunks) {
+        if (wantsStructured && chunk.type === 'agent_message_chunk') {
+          assistantBuffer += chunk.text;
+        }
+        queue.push({ kind: 'chunk', chunk });
+      }
+    } catch (err) {
+      queue.push({ kind: 'error', error: err as Error });
+    }
+  });
+
+  const onAbort = (): void => {
+    void session.abort().catch(err => {
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.abort_failed'
+      );
+    });
+  };
+  // `addEventListener('abort', ...)` is a no-op on an already-aborted signal,
+  // so short-circuit before handing the 24-hour sendAndWait path a signal
+  // that will never fire. Caller's caller (the executor) treats AbortError
+  // as a clean cancellation. Clean up listeners + queue first so the throw
+  // doesn't leak resources.
+  if (abortSignal?.aborted) {
+    onAbort();
+    queue.close();
+    try {
+      unsubscribe();
+    } catch (err) {
+      log.debug({ err }, 'copilot.unsubscribe_failed');
+    }
+    try {
+      await session.disconnect();
+    } catch (err) {
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.disconnect_failed'
+      );
+    }
+    throw new DOMException('Copilot sendQuery aborted before start', 'AbortError');
+  }
+  if (abortSignal) {
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  // Kick off sendAndWait; it resolves on `session.idle`. The explicit
+  // timeout overrides the SDK's 60s default — see SEND_AND_WAIT_TIMEOUT_MS.
+  let sendResult: AssistantMessageEvent | undefined;
+  const sendPromise = session.sendAndWait({ prompt }, SEND_AND_WAIT_TIMEOUT_MS).then(
+    (r: AssistantMessageEvent | undefined) => {
+      sendResult = r;
+      queue.push({ kind: 'done' });
+    },
+    (err: unknown) => {
+      queue.push({ kind: 'error', error: err as Error });
+    }
+  );
+
+  let sawAssistantContent = false;
+  try {
+    for await (const item of queue) {
+      if (item.kind === 'done') break;
+      if (item.kind === 'error') throw item.error;
+      if (item.chunk.type === 'agent_message_chunk') sawAssistantContent = true;
+      yield item.chunk;
+    }
+
+    // Safety net: if no `assistant.message` event reached the listener (older
+    // SDK, model quirks, BYOK provider), emit the final content from
+    // sendAndWait's return value so the user doesn't lose output.
+    if (!sawAssistantContent && sendResult?.data?.content) {
+      if (wantsStructured) assistantBuffer += sendResult.data.content;
+      yield { type: 'agent_message_chunk', text: sendResult.data.content };
+      sawAssistantContent = true;
+    }
+
+    // Emit the deferred session.error warning only if no assistant content
+    // reached the consumer. When the SDK auto-recovers and still delivers a
+    // fallback message (the common case for transient upstream errors), the
+    // warning is noise and gets suppressed.
+    if (!sawAssistantContent && errorMessage) {
+      yield { type: 'warning', code: 'copilot.session_error', message: errorMessage };
+    }
+
+    // Terminal result chunk — always emit, even on error, so the executor
+    // gets a session ID back (useful for resume).
+    const result: MessageChunk = {
+      type: 'result',
+      sessionId: session.sessionId,
+    };
+    if (capturedTokens) result.tokens = capturedTokens;
+    if (!sawAssistantContent && errorMessage) {
+      // Copilot's session.error carries only a message: an unknown failure, text as evidence.
+      result.isError = true;
+      result.errors = [errorMessage];
+      result.failure = { class: 'unknown', evidence: errorMessage };
+    }
+    if (wantsStructured) {
+      const parsed = tryParseStructuredOutput(assistantBuffer);
+      if (parsed !== undefined) {
+        result.structuredOutput = parsed;
+      } else {
+        log.warn(
+          {
+            bufferLength: assistantBuffer.length,
+            sessionIdPreview: sessionPreview(session.sessionId),
+          },
+          'copilot.structured_output_parse_failed'
+        );
+      }
+    }
+    yield result;
+  } finally {
+    queue.close();
+    try {
+      unsubscribe();
+    } catch (err) {
+      log.debug({ err }, 'copilot.unsubscribe_failed');
+    }
+    if (abortSignal) {
+      abortSignal.removeEventListener('abort', onAbort);
+    }
+    // Abort before disconnect: if the consumer closed the generator early
+    // (return() / break), sendAndWait is still running in the background.
+    // Without an explicit abort, the finally would wait on sendPromise for up
+    // to SEND_AND_WAIT_TIMEOUT_MS. abort() tells the SDK to cancel the run;
+    // disconnect() tears down the connection.
+    try {
+      await session.abort();
+    } catch (err) {
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.abort_cleanup_failed'
+      );
+    }
+    try {
+      await session.disconnect();
+    } catch (err) {
+      log.debug(
+        { err, sessionIdPreview: sessionPreview(session.sessionId) },
+        'copilot.disconnect_failed'
+      );
+    }
+    // Let the SDK's sendPromise settle so we don't leave a dangling promise.
+    // Any error was already pushed to the queue.
+    await sendPromise.catch(() => {
+      /* already surfaced via queue */
+    });
+  }
+}

@@ -1,0 +1,324 @@
+/**
+ * Database operations for users + per-platform user identities.
+ *
+ * Identity model:
+ *   remote_agent_users          — Archon-internal identity (one per human/bot)
+ *   remote_agent_user_identities — per-platform mapping; UNIQUE(platform, platform_user_id)
+ *
+ * Identity rows are created lazily on first sight by any chat/forge adapter
+ * via findOrCreateUserByPlatformIdentity. Concurrency: two simultaneous
+ * first-sight webhooks for the same (platform, platform_user_id) are race-safe
+ * — the UNIQUE constraint causes the second writer to throw, and we recover
+ * by re-SELECTing the winner's identity row.
+ */
+import { identityPlatformSchema, userRoleSchema } from '../schemas/user';
+import { pool, getDatabase, getDialect } from './connection';
+import type { IdentityPlatform, User, UserIdentity, UserRole } from '../types';
+import { createLogger } from '@archon/paths';
+
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('db.users');
+  return cachedLog;
+}
+
+/**
+ * Recognize the dialect-specific UNIQUE-constraint violation that signals a
+ * concurrent first-sight race. PG uses SQLSTATE 23505; bun:sqlite surfaces it
+ * via the error message. Anything else propagates — we don't want a generic
+ * `serialization failure` masquerading as a recoverable race.
+ */
+function isUniqueViolation(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  // Postgres node-pg attaches `.code = '23505'` to constraint errors
+  if ((err as Error & { code?: string }).code === '23505') return true;
+  // SQLite (bun:sqlite) surfaces as: "UNIQUE constraint failed: ..."
+  if (/UNIQUE constraint failed/i.test(err.message)) return true;
+  // Postgres without .code: "duplicate key value violates unique constraint"
+  if (/duplicate key value violates unique constraint/i.test(err.message)) return true;
+  return false;
+}
+
+export async function getUserById(id: string): Promise<User | null> {
+  const result = await pool.query<User>('SELECT * FROM remote_agent_users WHERE id = $1', [id]);
+  return result.rows[0] ?? null;
+}
+
+async function selectIdentity(
+  platform: IdentityPlatform,
+  platformUserId: string
+): Promise<UserIdentity | null> {
+  const result = await pool.query<UserIdentity>(
+    'SELECT * FROM remote_agent_user_identities WHERE platform = $1 AND platform_user_id = $2',
+    [platform, platformUserId]
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Resolve a platform-native user id to an Archon User row, creating the user
+ * and the identity mapping if this is the first time we've seen them.
+ *
+ * Behavior:
+ *  - If the identity exists AND the user row exists, return the user. If
+ *    `displayName` is provided and the stored values are NULL/empty,
+ *    opportunistically backfill them (cheap UX win). Backfill failures are
+ *    logged and swallowed — they must not block user resolution.
+ *  - If the identity exists but the user row is missing (rare orphan case),
+ *    repair by re-creating the user and rebinding the identity.
+ *  - If the identity does not exist, atomically create both rows in a
+ *    transaction. On UNIQUE-constraint race, recover via re-SELECT.
+ */
+export async function findOrCreateUserByPlatformIdentity(
+  platform: IdentityPlatform,
+  platformUserId: string,
+  displayName?: string
+): Promise<User> {
+  identityPlatformSchema.parse(platform);
+  getLog().debug({ platform }, 'user.create_started');
+
+  const existing = await selectIdentity(platform, platformUserId);
+
+  if (existing) {
+    const user = await getUserById(existing.user_id);
+    if (user) {
+      if (displayName) {
+        await backfillDisplayName(existing, user, displayName);
+      }
+      return user;
+    }
+    getLog().warn({ identityId: existing.id, platform }, 'user.identity_orphan_repair_started');
+    return await repairOrphanedIdentity(existing.id, platform, displayName);
+  }
+
+  const db = getDatabase();
+  try {
+    return await db.withTransaction(async q => {
+      const userResult = await q<User>(
+        'INSERT INTO remote_agent_users (display_name, role) VALUES ($1, $2) RETURNING *',
+        [displayName ?? null, userRoleSchema.enum.member]
+      );
+      const user = userResult.rows[0];
+      if (!user) {
+        throw new Error('users.create_returned_no_row');
+      }
+      await q<UserIdentity>(
+        `INSERT INTO remote_agent_user_identities (user_id, platform, platform_user_id, platform_display_name)
+         VALUES ($1, $2, $3, $4)`,
+        [user.id, platform, platformUserId, displayName ?? null]
+      );
+      getLog().info({ userId: user.id, platform }, 'user.create_completed');
+      return user;
+    });
+  } catch (err) {
+    // Narrow recovery: only UNIQUE-constraint violations indicate the concurrent
+    // first-sight race we know how to recover from. For anything else, surface
+    // the original error and rethrow — silently swallowing it would mask real
+    // DB failures behind a misleading "race recovery" path.
+    if (!isUniqueViolation(err)) {
+      getLog().error({ err, platform }, 'user.create_failed');
+      throw err;
+    }
+
+    const recovered = await selectIdentity(platform, platformUserId);
+    if (recovered) {
+      const user = await getUserById(recovered.user_id);
+      if (user) {
+        getLog().info({ platform, userId: user.id }, 'user.create_race_recovered');
+        return user;
+      }
+    }
+    // UNIQUE fired but recovery turned up empty (very unusual — possibly the
+    // winner was deleted between the failure and our re-SELECT). Surface the
+    // original error rather than silently returning undefined.
+    getLog().error({ err, platform }, 'user.create_failed_race_recovery_empty');
+    throw err;
+  }
+}
+
+/**
+ * Opportunistically backfill display_name on existing identity + user rows.
+ * Wrapped in try/catch because failure here must NOT block user resolution —
+ * the caller has the resolved user row already; a stale display_name is a
+ * recoverable UX glitch, not an attribution failure.
+ */
+async function backfillDisplayName(
+  identity: UserIdentity,
+  user: User,
+  displayName: string
+): Promise<void> {
+  try {
+    if (!identity.platform_display_name) {
+      await pool.query(
+        'UPDATE remote_agent_user_identities SET platform_display_name = $1 WHERE id = $2',
+        [displayName, identity.id]
+      );
+    }
+    if (!user.display_name) {
+      await updateUserDisplayName(user.id, displayName);
+    }
+  } catch (err) {
+    getLog().warn(
+      { err, userId: user.id, identityId: identity.id },
+      'user.display_name_backfill_failed'
+    );
+  }
+}
+
+async function repairOrphanedIdentity(
+  identityId: string,
+  platform: IdentityPlatform,
+  displayName: string | undefined
+): Promise<User> {
+  const db = getDatabase();
+  try {
+    return await db.withTransaction(async q => {
+      const userResult = await q<User>(
+        'INSERT INTO remote_agent_users (display_name, role) VALUES ($1, $2) RETURNING *',
+        [displayName ?? null, userRoleSchema.enum.member]
+      );
+      const user = userResult.rows[0];
+      if (!user) {
+        throw new Error('users.create_returned_no_row');
+      }
+      await q(
+        'UPDATE remote_agent_user_identities SET user_id = $1, platform_display_name = COALESCE(platform_display_name, $2) WHERE id = $3',
+        [user.id, displayName ?? null, identityId]
+      );
+      getLog().info(
+        { userId: user.id, identityId, platform },
+        'user.identity_orphan_repair_completed'
+      );
+      return user;
+    });
+  } catch (err) {
+    getLog().error({ err, identityId, platform }, 'user.identity_orphan_repair_failed');
+    throw err;
+  }
+}
+
+export async function updateUserDisplayName(userId: string, displayName: string): Promise<void> {
+  const dialect = getDialect();
+  await pool.query(
+    `UPDATE remote_agent_users SET display_name = $1, updated_at = ${dialect.now()} WHERE id = $2`,
+    [displayName, userId]
+  );
+}
+
+/**
+ * Raised when a GitHub account is already linked to a different Archon user.
+ * Connecting must never silently reassign an identity from one user to another.
+ * The message reaches users and logs, so it names neither the login nor the
+ * other user; the caller already knows which account it just authorized.
+ */
+export class GithubIdentityConflictError extends Error {
+  constructor() {
+    super('This GitHub account is already linked to a different Archon user.');
+    this.name = 'GithubIdentityConflictError';
+  }
+}
+
+/**
+ * Cache the user's GitHub profile on the users row (display_name + email).
+ * COALESCE keeps existing values when a field is omitted. Called at connect
+ * time (connectGithubForUser); token rotation persists tokens only and does not
+ * touch the profile.
+ */
+export async function updateUserGithubProfile(
+  userId: string,
+  profile: { display_name?: string | null; email?: string | null }
+): Promise<void> {
+  const dialect = getDialect();
+  await pool.query(
+    `UPDATE remote_agent_users
+       SET display_name = COALESCE($1, display_name),
+           email = COALESCE($2, email),
+           updated_at = ${dialect.now()}
+     WHERE id = $3`,
+    [profile.display_name ?? null, profile.email ?? null, userId]
+  );
+}
+
+export class PlatformIdentityConflictError extends Error {
+  constructor(
+    public readonly platform: IdentityPlatform,
+    public readonly platformUserId: string,
+    public readonly existingUserId: string,
+    public readonly requestedUserId: string
+  ) {
+    super(
+      `Identity ${platform}:${platformUserId} is already linked to user ${existingUserId}; linking it to user ${requestedUserId} requires moving it.`
+    );
+    this.name = 'PlatformIdentityConflictError';
+  }
+}
+
+export async function linkPlatformIdentity(
+  userId: string,
+  platform: IdentityPlatform,
+  platformUserId: string,
+  displayName?: string,
+  move = false
+): Promise<void> {
+  identityPlatformSchema.parse(platform);
+  if (!platformUserId.trim()) throw new Error('Platform user id must not be empty.');
+  if (!(await getUserById(userId))) throw new Error(`Unknown user id: ${userId}`);
+  // Read only to log who lost the identity; the write below decides ownership.
+  const prior = await selectIdentity(platform, platformUserId);
+
+  // Enforce ownership in the write itself so concurrent links cannot silently move an identity.
+  const result = await pool.query<UserIdentity>(
+    `INSERT INTO remote_agent_user_identities (user_id, platform, platform_user_id, platform_display_name)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (platform, platform_user_id) DO UPDATE
+     SET user_id = excluded.user_id,
+         platform_display_name = COALESCE(excluded.platform_display_name, remote_agent_user_identities.platform_display_name)
+     WHERE remote_agent_user_identities.user_id = excluded.user_id OR $5
+     RETURNING *`,
+    [userId, platform, platformUserId, displayName ?? null, move]
+  );
+  if (!result.rows[0]) {
+    const existing = await selectIdentity(platform, platformUserId);
+    if (!existing) throw new Error('Identity disappeared while linking; retry the command.');
+    throw new PlatformIdentityConflictError(platform, platformUserId, existing.user_id, userId);
+  }
+  const previousUserId = prior && prior.user_id !== userId ? prior.user_id : undefined;
+  getLog().info(
+    { userId, platform, ...(previousUserId ? { previousUserId } : {}) },
+    'user.identity_linked'
+  );
+}
+
+export async function linkGithubIdentity(userId: string, login: string): Promise<void> {
+  try {
+    await linkPlatformIdentity(userId, 'github', login, login);
+  } catch (err) {
+    if (err instanceof PlatformIdentityConflictError) throw new GithubIdentityConflictError();
+    throw err;
+  }
+}
+
+export async function listUsersWithIdentities(): Promise<
+  (User & { identities: UserIdentity[] })[]
+> {
+  const users = await pool.query<User>('SELECT * FROM remote_agent_users ORDER BY created_at, id');
+  const identities = await pool.query<UserIdentity>(
+    'SELECT * FROM remote_agent_user_identities ORDER BY platform, platform_user_id'
+  );
+  const byUser = new Map<string, UserIdentity[]>();
+  for (const identity of identities.rows) {
+    const group = byUser.get(identity.user_id) ?? [];
+    group.push(identity);
+    byUser.set(identity.user_id, group);
+  }
+  return users.rows.map(user => ({ ...user, identities: byUser.get(user.id) ?? [] }));
+}
+
+export async function setUserRole(userId: string, role: UserRole): Promise<void> {
+  const validatedRole = userRoleSchema.parse(role);
+  const result = await pool.query(
+    `UPDATE remote_agent_users SET role = $1, updated_at = ${getDialect().now()} WHERE id = $2`,
+    [validatedRole, userId]
+  );
+  if (result.rowCount === 0) throw new Error(`Unknown user id: ${userId}`);
+}

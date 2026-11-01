@@ -1,0 +1,66 @@
+/**
+ * Zod schemas for provider API endpoints.
+ */
+import { z } from '@hono/zod-openapi';
+import { EFFORT_LADDER } from '@archon/provider-contract';
+import { providerCapabilitiesSchema } from '@archon/provider-contract';
+
+/** A single provider info entry (API-safe projection of ProviderRegistration). */
+export const providerInfoSchema = z
+  .object({
+    id: z.string(),
+    displayName: z.string(),
+    // Rebuilt from its shape: zod copies `.openapi` onto a schema only when it is created
+    // after `@hono/zod-openapi` loads, and the providers load the contract package first.
+    capabilities: z.object(providerCapabilitiesSchema.shape).openapi('ProviderCapabilities'),
+    builtIn: z.boolean(),
+    effortLevels: z.array(z.enum(EFFORT_LADDER)).optional(),
+  })
+  .openapi('ProviderInfo');
+
+/** Response for GET /api/providers. */
+export const providerListResponseSchema = z
+  .object({
+    providers: z.array(providerInfoSchema),
+  })
+  .openapi('ProviderListResponse');
+
+/** One Pi catalog model — metadata only (no credentials). */
+export const piModelInfoSchema = z
+  .object({
+    ref: z.string(),
+    provider: z.string(),
+    id: z.string(),
+    name: z.string(),
+    reasoning: z.boolean(),
+    cost: z.object({ input: z.number(), output: z.number() }),
+    contextWindow: z.number(),
+  })
+  .openapi('PiModelInfo');
+
+/** Response for GET /api/providers/pi/models — `[]` when the catalog can't load. */
+export const piModelListResponseSchema = z
+  .object({
+    models: z.array(piModelInfoSchema),
+  })
+  .openapi('PiModelListResponse');
+
+/** One OpenCode backend provider, introspected from the embedded server (#1955). */
+export const opencodeCredentialProviderSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    env: z.array(z.string()),
+    /** Install-wide: OpenCode's auth store is server-global, not per-user. */
+    connected: z.boolean(),
+    modelCount: z.number(),
+    authMethods: z.array(z.object({ type: z.enum(['oauth', 'api']), label: z.string() })),
+  })
+  .openapi('OpencodeCredentialProvider');
+
+/** Response for GET /api/providers/opencode/credentials. */
+export const opencodeCredentialListResponseSchema = z
+  .object({
+    providers: z.array(opencodeCredentialProviderSchema),
+  })
+  .openapi('OpencodeCredentialListResponse');

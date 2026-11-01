@@ -1,0 +1,275 @@
+// @archon-test-isolated
+import { describe, test, expect, beforeAll, afterEach } from 'bun:test';
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers/in-process';
+import { getRegisteredProviders, PI_PROVIDER_ENV_VARS } from '@archon/providers';
+import {
+  getVendorCatalog,
+  listConnectableVendors,
+  isConnectableVendor,
+  buildAgentCredentialMatrix,
+  type AgentCredentialStatus,
+} from './catalog';
+
+import {
+  SUBSCRIPTION_PROVIDERS,
+  OPENAI_SUBSCRIPTION_VENDOR,
+  subscriptionOAuthProviderFor,
+} from './oauth-providers';
+
+beforeAll(() => {
+  // The catalog derives from the provider registry — bootstrap like entrypoints do.
+  registerBuiltinProviders();
+  registerCommunityProviders();
+});
+
+const TOUCHED_ENV = ['OPENROUTER_API_KEY', 'AWS_PROFILE'];
+const savedEnv = new Map<string, string | undefined>(TOUCHED_ENV.map(k => [k, process.env[k]]));
+afterEach(() => {
+  for (const [k, v] of savedEnv) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+});
+
+describe('credentials/catalog', () => {
+  test('every static subscription spec has a core login flow and every flow is advertised', () => {
+    const vendors = new Set(
+      getRegisteredProviders().flatMap(reg =>
+        reg.credentials.kind === 'static'
+          ? reg.credentials.specs
+              .filter(spec => spec.kinds.includes('subscription'))
+              .map(spec => spec.vendor)
+          : []
+      )
+    );
+    expect([...vendors].sort()).toEqual([...SUBSCRIPTION_PROVIDERS].sort());
+    for (const vendor of vendors) {
+      if (vendor === OPENAI_SUBSCRIPTION_VENDOR) continue;
+      const provider = subscriptionOAuthProviderFor(vendor);
+      expect(provider?.login).toBeFunction();
+      expect(provider?.refreshToken).toBeFunction();
+    }
+  });
+  test('union catalog merges vendors across agents with agent attribution', () => {
+    const catalog = getVendorCatalog();
+    // anthropic is consumed by both Claude Code and Pi.
+    const anthropic = catalog.get('anthropic');
+    expect(anthropic).toBeDefined();
+    expect(anthropic!.agents).toContain('claude');
+    expect(anthropic!.agents).toContain('pi');
+    expect(anthropic!.kinds).toContain('api_key');
+    expect(anthropic!.kinds).toContain('subscription');
+    // The subscription comes from Claude Code: Pi consumes only an Anthropic API key.
+    const pi = getRegisteredProviders().find(reg => reg.id === 'pi')!.credentials;
+    expect(
+      pi.kind === 'static' && pi.specs.find(spec => spec.vendor === 'anthropic')?.kinds
+    ).toEqual(['api_key']);
+    // Pi-only backends carry only Pi.
+    expect(catalog.get('openrouter')?.agents).toEqual(['pi']);
+    // Ambient-only vendors are present but not api_key-connectable.
+    expect(catalog.get('amazon-bedrock')?.kinds).toEqual(['ambient']);
+  });
+
+  test('Azure uses the new Pi vendor id while existing connections remain visible', () => {
+    expect(getVendorCatalog().get('azure')).toEqual({
+      vendor: 'azure',
+      displayName: 'Azure OpenAI',
+      kinds: ['api_key'],
+      agents: ['pi'],
+    });
+    const pi = buildAgentCredentialMatrix([
+      { provider: 'azure-openai-responses', kind: 'api_key' },
+    ]).find(agent => agent.id === 'pi');
+    expect(pi?.credentials.find(credential => credential.vendor === 'azure')?.connected).toBe(
+      'api_key'
+    );
+  });
+
+  test('legacy agent ids are not catalog vendors; opencode contributes nothing static', () => {
+    const catalog = getVendorCatalog();
+    for (const legacy of ['claude', 'codex', 'copilot']) {
+      expect(catalog.has(legacy)).toBe(false);
+    }
+    // The OpenCode HARNESS is dynamic (no static specs) — but 'opencode' the
+    // vendor id exists via Pi's OpenCode Zen backend. Its only agent is pi.
+    expect(catalog.get('opencode')?.agents).toEqual(['pi']);
+  });
+
+  test('listConnectableVendors is sorted and excludes ambient-only vendors', () => {
+    const vendors = listConnectableVendors();
+    expect(vendors).toEqual([...vendors].sort());
+    expect(vendors).toContain('anthropic');
+    expect(vendors).toContain('github-copilot');
+    expect(vendors).toContain('google-vertex'); // api_key-capable despite also-ambient
+    expect(vendors).not.toContain('amazon-bedrock');
+  });
+
+  test('throws when a registration declares an undeliverable api_key vendor', async () => {
+    const { registerProvider, clearRegistry } = await import('@archon/providers');
+    try {
+      registerProvider({
+        id: 'broken-test-agent',
+        displayName: 'Broken Test Agent',
+        builtIn: false,
+        parseConfig: raw => raw,
+        capabilities: {} as never,
+        factory: () => ({}) as never,
+        credentials: {
+          kind: 'static',
+          vendorFor: () => 'no-such-vendor',
+          specs: [{ vendor: 'no-such-vendor', displayName: 'Nope', kinds: ['api_key'] }],
+        },
+      });
+      expect(() => getVendorCatalog()).toThrow(/no-such-vendor/);
+    } finally {
+      clearRegistry();
+      registerBuiltinProviders();
+      registerCommunityProviders();
+    }
+  });
+
+  test('isConnectableVendor accepts legacy ids via normalization', () => {
+    expect(isConnectableVendor('claude')).toBe(true);
+    expect(isConnectableVendor('codex')).toBe(true);
+    expect(isConnectableVendor('copilot')).toBe(true);
+    expect(isConnectableVendor('amazon-bedrock')).toBe(false);
+    expect(isConnectableVendor('bogus')).toBe(false);
+  });
+
+  describe('buildAgentCredentialMatrix', () => {
+    test('marks user connections per vendor (legacy rows normalize)', () => {
+      const matrix = buildAgentCredentialMatrix([
+        { provider: 'claude', kind: 'oauth' },
+        { provider: 'openrouter', kind: 'api_key' },
+      ]);
+      const claude = matrix.find(a => a.id === 'claude')!;
+      expect(claude.catalog).toBe('static');
+      expect(claude.credentials[0]!.vendor).toBe('anthropic');
+      expect(claude.credentials[0]!.connected).toBe('oauth');
+      expect(claude.ready).toBe(true);
+
+      const pi = matrix.find(a => a.id === 'pi')!;
+      expect(pi.credentials.find(s => s.vendor === 'openrouter')!.connected).toBe('api_key');
+      expect(pi.credentials.find(s => s.vendor === 'anthropic')!.connected).toBe('oauth');
+      expect(pi.ready).toBe(true);
+    });
+
+    /** Runs `fn` with every credential env var the matrix reads unset, then `env` applied. */
+    function withCredentialEnv(env: Record<string, string>, fn: () => void): void {
+      const keys = [
+        ...Object.values(PI_PROVIDER_ENV_VARS),
+        'CLAUDE_API_KEY',
+        'CLAUDE_CODE_OAUTH_TOKEN',
+        'ANTHROPIC_OAUTH_TOKEN',
+        'AWS_PROFILE',
+        'AWS_ACCESS_KEY_ID',
+        'AWS_BEARER_TOKEN_BEDROCK',
+        'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI',
+        'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+        'AWS_WEB_IDENTITY_TOKEN_FILE',
+        'GOOGLE_CLOUD_PROJECT',
+        'GCLOUD_PROJECT',
+      ];
+      const saved = keys.map(key => [key, process.env[key]] as const);
+      for (const key of keys) delete process.env[key];
+      Object.assign(process.env, env);
+      try {
+        fn();
+      } finally {
+        for (const [key, value] of saved) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    }
+
+    function anthropicRow(
+      matrix: ReturnType<typeof buildAgentCredentialMatrix>,
+      agentId: string
+    ): { ready: boolean; row: AgentCredentialStatus } {
+      const agent = matrix.find(a => a.id === agentId)!;
+      return { ready: agent.ready, row: agent.credentials.find(s => s.vendor === 'anthropic')! };
+    }
+
+    test('a Claude subscription makes Claude Code ready, not Pi', () => {
+      withCredentialEnv({}, () => {
+        const matrix = buildAgentCredentialMatrix([{ provider: 'anthropic', kind: 'oauth' }]);
+        const claude = anthropicRow(matrix, 'claude');
+        expect(claude.ready).toBe(true);
+        expect(claude.row).toMatchObject({ connectionConsumed: true, usable: true });
+        const pi = anthropicRow(matrix, 'pi');
+        expect(pi.row).toMatchObject({
+          connected: 'oauth',
+          connectionConsumed: false,
+          subscriptionAvailable: false,
+          usable: false,
+        });
+        expect(pi.ready).toBe(false);
+      });
+    });
+
+    test('install env counts only the variables the agent itself reads', () => {
+      withCredentialEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'test-token' }, () => {
+        const matrix = buildAgentCredentialMatrix([]);
+        expect(anthropicRow(matrix, 'claude').ready).toBe(true);
+        expect(anthropicRow(matrix, 'pi').row.installEnv).toBe(false);
+        expect(anthropicRow(matrix, 'pi').ready).toBe(false);
+      });
+      withCredentialEnv({ ANTHROPIC_OAUTH_TOKEN: 'test-token' }, () => {
+        const pi = anthropicRow(buildAgentCredentialMatrix([]), 'pi');
+        expect(pi.row.installEnv).toBe(false);
+        expect(pi.ready).toBe(false);
+      });
+    });
+
+    test('subscriptionAvailable: all three subscription vendors connectable (#1924 gate lifted)', () => {
+      const matrix = buildAgentCredentialMatrix([]);
+      const codex = matrix.find(a => a.id === 'codex')!;
+      expect(codex.credentials[0]!.vendor).toBe('openai');
+      expect(codex.credentials[0]!.subscriptionAvailable).toBe(true);
+      const claude = matrix.find(a => a.id === 'claude')!;
+      expect(claude.credentials[0]!.subscriptionAvailable).toBe(true);
+      const copilot = matrix.find(a => a.id === 'copilot')!;
+      expect(copilot.credentials[0]!.subscriptionAvailable).toBe(true);
+    });
+
+    test('install-env detection feeds readiness without any stored connection', () => {
+      delete process.env.OPENROUTER_API_KEY;
+      let matrix = buildAgentCredentialMatrix([]);
+      let pi = matrix.find(a => a.id === 'pi')!;
+      const before = pi.credentials.find(s => s.vendor === 'openrouter')!;
+      expect(before.installEnv).toBe(false);
+
+      process.env.OPENROUTER_API_KEY = 'sk-or-env';
+      matrix = buildAgentCredentialMatrix([]);
+      pi = matrix.find(a => a.id === 'pi')!;
+      const after = pi.credentials.find(s => s.vendor === 'openrouter')!;
+      expect(after.installEnv).toBe(true);
+      expect(pi.ready).toBe(true);
+    });
+
+    test('ambient detection reports amazon-bedrock from the AWS env chain', () => {
+      delete process.env.AWS_PROFILE;
+      let matrix = buildAgentCredentialMatrix([]);
+      let bedrock = matrix
+        .find(a => a.id === 'pi')!
+        .credentials.find(s => s.vendor === 'amazon-bedrock')!;
+      expect(bedrock.ambientConfigured).toBe(false);
+
+      process.env.AWS_PROFILE = 'test-profile';
+      matrix = buildAgentCredentialMatrix([]);
+      bedrock = matrix
+        .find(a => a.id === 'pi')!
+        .credentials.find(s => s.vendor === 'amazon-bedrock')!;
+      expect(bedrock.ambientConfigured).toBe(true);
+    });
+
+    test('opencode is dynamic: empty credentials, never ready from the matrix', () => {
+      const matrix = buildAgentCredentialMatrix([{ provider: 'anthropic', kind: 'api_key' }]);
+      const opencode = matrix.find(a => a.id === 'opencode')!;
+      expect(opencode.catalog).toBe('dynamic');
+      expect(opencode.credentials).toEqual([]);
+      expect(opencode.ready).toBe(false);
+    });
+  });
+});

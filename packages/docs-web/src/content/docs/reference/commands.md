@@ -1,0 +1,141 @@
+---
+title: Commands Reference
+description: Archon orchestrator commands and how to submit them, including through a bot mention in Slack threads.
+category: reference
+area: handlers
+audience: [user]
+status: current
+sidebar:
+  order: 4
+---
+
+All orchestrator commands available in Archon. Type `/help` in your conversation to see this list. On Slack, post an @mention carrying the command in the target thread, for example `@your-bot /help` or `@your-bot /setproject <name>`. Raw orchestrator slash commands are not registered with Slack; `/archon <message>` starts a new thread.
+
+---
+
+## Deterministic Commands
+
+These commands are handled deterministically by the orchestrator — they always execute the same way regardless of AI state:
+
+## Project Management
+
+| Command | Description |
+|---------|-------------|
+| `/register-project <name> <path>` | Register a local directory as a project |
+| `/update-project <name> <path>` | Update a project's directory path |
+| `/remove-project <name>` | Remove a project registration |
+| `/setproject <name>` | Bind this conversation to a registered project. Clears any working-directory/worktree override and starts a fresh AI session on the next message (chat history stays visible) |
+| `/detach-project "<current-project-name>"` | Make only this conversation neutral; the project stays registered. Requires the exact, unambiguous current name (quote names containing spaces). Refuses pending/running/paused/resumable failed runs and any attached worktree or container. Resolve runs through `manage_run`, CLI or Web controls, and clean the environment through existing isolation controls before retrying. Supported on Web, Telegram and independently scoped Slack/Discord conversations; refuses children with bound parents, forge conversations and ephemeral CLI chat |
+
+## Workflows
+
+| Command | Description |
+|---------|-------------|
+| `/workflow list` | Show available workflows |
+| `/workflow reload` | Reload workflow definitions |
+| `/workflow status` | Show active workflows |
+| `/workflow get <id>` | Show one run, whatever its status |
+| `/workflow cancel [id]` | Cancel a running workflow (default: this conversation's). Refuses when no owner answers; check the recorded host and pid, verify the owner has stopped, then use `/workflow abandon <id>` |
+| `/workflow resume <id>` | Resume a failed or paused run (re-runs, skipping completed nodes) |
+| `/workflow abandon <id>` | Discard a run (running, paused, or failed) and attempt removal of the worktree it created, keeping the branch. Owner warnings retain the checkout: inspect it (`lsof` when output is still held), resolve the warning, then run abandon again on the cancelled run to retry removal. A silent descendant also retains its checkout and the selected root's checkout, even if the root's owner stopped; each descendant needs its own owner check. If the selected sub-run has no answering endpoint, cancellation succeeds but its subtree's owned checkouts remain: silence does not prove the enclosing execution stopped. Inspect the owning execution and stop or abandon it only if you intend to stop its whole scope; repeated child-only abandonment may still retain the checkouts. |
+| `/workflow approve <id> [comment]` | Answer `approve` to a paused run: an attention wait, or a deprecated approval gate (deprecated interactive-loop gates: no comment on a signal-bearing gate = accept & complete; a comment runs another iteration) |
+| `/workflow reject <id> [reason]` | Answer `reject` to a paused run (attention wait or deprecated approval gate). Rejecting an attention wait continues the run with `decision: reject` |
+| `/workflow run <name> [args]` | Run a workflow directly |
+| `/workflow cleanup [days]` | CLI only -- delete old run records (default: 7 days) |
+
+> **Note:** Workflows are YAML files in `.archon/workflows/`
+
+## Session Management
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Show conversation state |
+| `/reset` | Start fresh: clears the AI session, releases the execution binding (working-directory override + isolation env), and abandons this conversation's **resumable** run trees (`paused`/`failed`) so the next message does not continue one, attempting to remove the worktrees those runs created (their branches are kept). Owner warnings retain affected checkouts: inspect them (`lsof` when output is still held), resolve the warning, then use `/workflow abandon <id>` on each cancelled run to retry removal. Runs that are actively executing (`pending`/`running`) are never touched -- they may belong to another process entirely. Each cleanup effect still runs if another fails; an incomplete reset tells you to retry and does not promise a fresh next message. The project attachment (`codebase_id`) is preserved; use `/detach-project "<current-project-name>"` to detach it after resolving blockers. Retention follows the checkout ID: a separate checkout can still release after its owner stops. A sub-run without an answering endpoint retains its checkout, even if this reset stops another run with matching host, PID, and user metadata: those fields cannot identify a process incarnation, and the enclosing execution may still be active. Inspect that execution before stopping or abandoning its whole scope; repeated child-only abandonment may still retain the checkout. |
+| `/help` | Show all commands |
+
+---
+
+## AI-Routed Commands
+
+The following commands exist in the command handler but are **not** deterministically routed. Instead, they are routed through the AI orchestrator, which decides whether to invoke them based on context. They work when the AI routes a message to them:
+
+| Command | Description |
+|---------|-------------|
+| `/clone <repo-url>` | Clone repository |
+| `/repos` | List repositories (numbered) |
+| `/repo <#\|name> [pull]` | Switch repo (auto-loads commands) |
+| `/repo-remove <#\|name>` | Remove repo and codebase record |
+| `/getcwd` | Show working directory |
+| `/setcwd <path>` | Set working directory |
+| `/command-set <name> <path> [text]` | Register a command from file |
+| `/load-commands <folder>` | Bulk load commands (recursive) |
+| `/commands` | List registered commands |
+| `/worktree create <branch>` | Create isolated worktree |
+| `/worktree list` | Show worktrees for this repo |
+| `/worktree remove [--force]` | Remove current worktree |
+| `/worktree cleanup merged\|stale` | Clean up worktrees |
+| `/worktree orphans` | Show secondary local-branch worktrees, including those created externally; use `git worktree list` for the full inventory |
+| `/init` | Create `.archon` structure in current repo |
+| `/reset-context` | Reset AI context, keep worktree |
+
+> **Note:** In practice, you rarely need to type these commands directly. Describe what you want in natural language and the AI router will invoke the appropriate command or workflow.
+
+---
+
+## Example Workflow (Telegram)
+
+### Ask Questions Directly
+
+```
+You: What's the structure of this repo?
+
+Bot: [Claude analyzes and responds...]
+```
+
+### Check Status
+
+```
+You: /status
+
+Bot: ## Orchestrator Status
+
+     **Platform**: telegram
+     **AI Assistant**: claude
+
+     ## Registered Projects (1)
+     - my-project (github.com)
+
+     ## Conversation Context
+     - Project: my-project @ main
+     - Working Directory: /workspace/my-project
+
+     Worktrees: 0 total
+```
+
+### Reset Session
+
+```
+You: /reset
+
+Bot: Session cleared. Cleared workspace binding (worktree + isolation env).
+     Abandoned 1 resumable run(s). Project attachment preserved — next message
+     starts fresh.
+```
+
+---
+
+## Example Workflow (GitHub)
+
+Create an issue or comment on an existing issue/PR:
+
+```
+@your-bot-name can you help me understand the authentication flow?
+```
+
+Bot responds with analysis. Continue the conversation:
+
+```
+@your-bot-name can you create a sequence diagram for this?
+```
+
+Bot maintains context and provides the diagram.

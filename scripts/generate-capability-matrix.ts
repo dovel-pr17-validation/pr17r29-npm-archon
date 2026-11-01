@@ -1,0 +1,338 @@
+#!/usr/bin/env bun
+/**
+ * Regenerates the canonical provider capability matrix docs page
+ * (packages/docs-web/src/content/docs/reference/provider-capabilities.md)
+ * from the registered providers' `capabilities.ts` constants (#2116).
+ *
+ * Why: provider capability documentation was hand-maintained in several
+ * surfaces (CLAUDE.md, the docs-web assistant guides, the archon skill) and
+ * each independently drifted from packages/providers/src/*\/capabilities.ts.
+ * The 2026-07-14 audits found the same error class everywhere (providers
+ * under/over-claiming per-node mcp / tool restrictions / skills / agents /
+ * hooks). Generating one canonical table from the registry's capability
+ * constants — the SAME objects the dag-executor reads to decide its
+ * ignored-capability warnings — makes a capability change a `bun run validate`
+ * failure until the docs are regenerated.
+ *
+ * Source of truth: the provider registry (registerInProcessProviders →
+ * getRegisteredProviders). The factories stay lazy,
+ * so no provider is instantiated; we only read the static capability metadata.
+ *
+ * Usage:
+ *   bun run scripts/generate-capability-matrix.ts          # write
+ *   bun run scripts/generate-capability-matrix.ts --check  # verify (exit 2 if stale)
+ *
+ * Exit codes:
+ *   0  file generated (and unchanged, if --check)
+ *   1  unexpected error (uncovered capability axis, registry failure)
+ *   2  --check was passed and the file would change
+ */
+import { readFile, writeFile } from 'fs/promises';
+import { join, resolve } from 'path';
+import { getRegisteredProviders, DEPRECATED_PROVIDERS_DOCS_PATH } from '@archon/providers';
+import { registerInProcessProviders } from '@archon/providers/in-process';
+import type { ProviderCapabilities, ProviderRegistration } from '@archon/providers';
+import { providerCapabilitiesSchema } from '../packages/provider-contract/src/capabilities';
+
+const REPO_ROOT = resolve(import.meta.dir, '..');
+const OUTPUT_PATH = join(
+  REPO_ROOT,
+  'packages/docs-web/src/content/docs/reference/provider-capabilities.md'
+);
+const CHECK_ONLY = process.argv.includes('--check');
+
+/**
+ * Ordered rows of the matrix. `key` is the `ProviderCapabilities` field, so a
+ * renamed/removed field is a compile error here. The totality guard below fails
+ * loudly if a schema field has neither an axis nor an explicit skip, even when
+ * no provider declares that optional field.
+ */
+const AXES: readonly { key: keyof ProviderCapabilities; label: string }[] = [
+  { key: 'backgroundWork', label: 'Background work observation' },
+  { key: 'sessionResume', label: 'Session resume' },
+  {
+    key: 'sessionFork',
+    label: 'Immutable session fork (`context.resume`, cross-run `persist_session`)',
+  },
+  { key: 'mcp', label: 'MCP servers (`mcp:`)' },
+  { key: 'hooks', label: 'Hooks (`hooks:`)' },
+  { key: 'skills', label: 'Skills (`skills:`)' },
+  { key: 'plugins', label: 'Plugins (`plugins:`)' },
+  { key: 'agents', label: 'Inline sub-agents (`agents:`)' },
+  { key: 'toolRestrictions', label: 'Tool restrictions (`allowed_tools`/`denied_tools`)' },
+  { key: 'structuredOutput', label: 'Structured output (`output_format`)' },
+  { key: 'envInjection', label: 'Env injection (`env:`)' },
+  { key: 'costControl', label: 'Spend limit (`maxBudgetUsd`)' },
+  { key: 'costReporting', label: 'Cost reporting (`costUsd`)' },
+  { key: 'tokenReporting', label: 'Token reporting' },
+  { key: 'stopReasonReporting', label: 'Stop reason reporting' },
+  { key: 'turnCountReporting', label: 'Turn count reporting' },
+  { key: 'resolvedModelReporting', label: 'Resolved model reporting' },
+  { key: 'effortControl', label: 'Effort control (`effort`)' },
+  { key: 'fallbackModel', label: 'Fallback model (`fallbackModel`)' },
+  { key: 'sandbox', label: 'Sandbox (`sandbox`)' },
+  { key: 'settingSources', label: 'Setting sources (`settingSources`)' },
+  { key: 'nativeTools', label: 'In-process native tools' },
+  { key: 'containerExec', label: 'Container exec (folder-project container backend)' },
+  {
+    key: 'requiresAllPropertiesRequired',
+    label: 'Strict-mode `required` coverage (every key in `properties` MUST appear in `required`)',
+  },
+];
+
+/**
+ * Capability keys intentionally excluded from the matrix: advisory tool-name
+ * vocabulary, not a supported/unsupported axis. Listed so the totality guard
+ * treats them as covered rather than flagging them as a missing axis.
+ */
+const SKIP_KEYS = new Set<keyof ProviderCapabilities>(['knownToolNames', 'renamedTools']);
+
+/**
+ * Per-cell caveats (#2219): capabilities that ARE wired for a provider but
+ * with semantics that differ from the axis's headline meaning. Each entry
+ * renders as a superscript marker on the cell (e.g. ✅¹) plus a numbered
+ * entry in the "Caveats" section under the table. Tier-valued axes
+ * (structuredOutput) already express their nuance directly in the cell — do
+ * not duplicate them here. `resolveCaveats` fails the generator on stale
+ * entries (unknown provider, axis-less key, or a caveat on a ❌ cell).
+ */
+const CAVEATS: readonly { provider: string; key: keyof ProviderCapabilities; note: string }[] = [
+  {
+    provider: 'opencode',
+    key: 'agents',
+    note:
+      'Config-file-based agent selection (named agents from `opencode.json`) with per-call ' +
+      'model/tools overrides — not inline sub-agent definitions.',
+  },
+];
+
+const SUPERSCRIPT_DIGITS = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'] as const;
+
+/** Render a positive integer as unicode superscript digits (1 → ¹, 12 → ¹²). */
+function superscript(n: number): string {
+  return String(n)
+    .split('')
+    .map(d => SUPERSCRIPT_DIGITS[Number(d)])
+    .join('');
+}
+
+/** A caveat validated against the registry and joined with its axis label. */
+interface ResolvedCaveat {
+  provider: string;
+  key: keyof ProviderCapabilities;
+  axisLabel: string;
+  note: string;
+}
+
+/** Render a single provider's value for an axis. */
+export function renderCell(caps: ProviderCapabilities, key: keyof ProviderCapabilities): string {
+  if (key === 'backgroundWork') return caps.backgroundWork;
+  if (key === 'structuredOutput') {
+    const tier = caps.structuredOutput;
+    if (tier === 'enforced') return '**enforced**';
+    if (tier === 'best-effort') return 'best-effort';
+    return '❌';
+  }
+  // sessionFork predates reporting declarations and explicitly defines omission as unsupported.
+  if (caps[key] === undefined && key !== 'sessionFork') return 'Unknown';
+  return caps[key] ? '✅' : '❌';
+}
+
+/**
+ * Optional fields belong in the matrix even before any provider declares them.
+ */
+function assertTotalCoverage(): void {
+  const covered = new Set<string>([...AXES.map(a => a.key), ...SKIP_KEYS]);
+  const uncovered = Object.keys(providerCapabilitiesSchema.shape).filter(key => !covered.has(key));
+  if (uncovered.length > 0) {
+    throw new Error(
+      `ProviderCapabilities field(s) not represented in the capability matrix: ${uncovered.join(', ')}. ` +
+        'Add an axis in scripts/generate-capability-matrix.ts (or add to SKIP_KEYS if advisory-only).'
+    );
+  }
+}
+
+/**
+ * Validate the CAVEATS table and resolve each entry to its matrix axis.
+ * Fails loudly on stale caveats: every caveat must point at a registered
+ * provider, at a capability the matrix renders as an axis, and at a cell that
+ * renders as supported — a caveat on a ❌ cell means the capability was turned
+ * off and the caveat text is stale.
+ */
+function resolveCaveats(providers: ProviderRegistration[]): ResolvedCaveat[] {
+  const axisByKey = new Map(AXES.map(a => [a.key, a] as const));
+  return CAVEATS.map(caveat => {
+    const provider = providers.find(p => p.id === caveat.provider);
+    if (!provider) {
+      throw new Error(
+        `Caveat references unknown provider '${caveat.provider}'. Registered: ${providers.map(p => p.id).join(', ')}.`
+      );
+    }
+    const axis = axisByKey.get(caveat.key);
+    if (!axis) {
+      throw new Error(
+        `Caveat for '${caveat.provider}' references capability '${caveat.key}', which has no matrix axis.`
+      );
+    }
+    if (renderCell(provider.capabilities, caveat.key) === '❌') {
+      throw new Error(
+        `Stale caveat: '${caveat.provider}' no longer declares '${caveat.key}' (cell renders ❌). Remove the caveat entry.`
+      );
+    }
+    return { provider: caveat.provider, key: caveat.key, axisLabel: axis.label, note: caveat.note };
+  });
+}
+
+function providerTags(p: ProviderRegistration): string {
+  const tags = [
+    ...(p.builtIn ? [] : ['community provider']),
+    ...(p.deprecationNotice ? [`[deprecated](${DEPRECATED_PROVIDERS_DOCS_PATH})`] : []),
+  ];
+  return tags.length > 0 ? ` *(${tags.join(', ')})*` : '';
+}
+
+function buildMarkdown(providers: ProviderRegistration[], caveats: ResolvedCaveat[]): string {
+  const ids = providers.map(p => p.id);
+
+  const providerList = providers
+    .map(p => `- \`${p.id}\` — ${p.displayName}${providerTags(p)}`)
+    .join('\n');
+
+  const header = `| Capability | ${ids.map(id => `\`${id}\``).join(' | ')} |`;
+  const divider = `|${' --- |'.repeat(ids.length + 1)}`;
+  const rows = AXES.map(axis => {
+    const cells = providers.map(p => {
+      const cell = renderCell(p.capabilities, axis.key);
+      const idx = caveats.findIndex(c => c.provider === p.id && c.key === axis.key);
+      return idx === -1 ? cell : `${cell}${superscript(idx + 1)}`;
+    });
+    return `| ${axis.label} | ${cells.join(' | ')} |`;
+  }).join('\n');
+
+  const caveatList = caveats
+    .map((c, i) => `- ${superscript(i + 1)} \`${c.provider}\` — ${c.axisLabel} — ${c.note}`)
+    .join('\n');
+
+  return [
+    '---',
+    'title: Provider Capability Matrix',
+    'description: Canonical per-provider capability matrix, generated from each provider capabilities.ts.',
+    'category: reference',
+    'area: clients',
+    'audience: [user, developer]',
+    'status: current',
+    'sidebar:',
+    '  order: 10',
+    '---',
+    '',
+    '<!-- AUTO-GENERATED — DO NOT EDIT. Regenerate with: bun run generate:capability-matrix -->',
+    '',
+    ':::note',
+    "This page is **auto-generated** from each provider's `capabilities.ts` (the same",
+    'constants the workflow engine reads to enforce provider-specific behavior). Do not',
+    'edit it by hand — run `bun run generate:capability-matrix`.',
+    'A capability change fails `bun run validate` until this page is regenerated.',
+    ':::',
+    '',
+    'Each column is a registered provider id (the value you set as `provider:` in a',
+    'workflow or `.archon/config.yaml`). A ✅ means Archon translates the corresponding',
+    'capability for that provider; a ❌ means the capability is unsupported. Unsupported',
+    'behavior is feature-specific: some optional fields are ignored with a warning, while',
+    'strict contracts fail closed. In particular, a node naming `mcp:`, `skills:` or',
+    '`plugins:` on a provider without that capability fails the run before any node',
+    'starts, and `context.resume` rejects an explicitly unsupported provider at load',
+    'time and an implicitly resolved one at runtime. An `mcp:` declared `optional: true`',
+    'instead runs the node without its servers and records why.',
+    '',
+    'The columns are the providers built from this repository. Release binaries install',
+    'Claude, Codex and Pi as provider plugins, with the same capabilities. A third-party',
+    'provider plugin declares its capabilities in its install-time descriptor and is not',
+    'a column in this generated table. The same pre-spend capability checks apply.',
+    '',
+    'Reporting flags describe SDK fields that Archon translates into execution results.',
+    'Supported does not guarantee that every result reports a value or that usage includes',
+    'all nested agents. Unsupported fields remain absent; Archon does not estimate cost,',
+    'count events as turns, or substitute the requested model for an unreported model.',
+    'Cost reporting is independent of spend-limit support. Older providers may omit',
+    'reporting declarations; absence means unknown, not unsupported.',
+    '',
+    'Background work: `reported` waits for runtime-reported task endings; `none` means verified absent;',
+    '`unobserved` means background work may exist without an observable lifecycle. A process',
+    'backgrounded inside a foreground shell command (`cmd &`) is invisible to every provider.',
+    'Codex observes subagents through `subAgentActivity` notifications and unified-exec processes',
+    'through `commandExecution` items with source `unifiedExecStartup`. Idle thread status is',
+    'not evidence that this work has ended. See [Streaming event mapping](/contributing/adding-a-community-provider/#streaming-event-mapping)',
+    'for the background-start admission and observation cutoff rules.',
+    '',
+    '## Providers',
+    '',
+    providerList,
+    '',
+    '## Capabilities',
+    '',
+    header,
+    divider,
+    rows,
+    '',
+    ...(caveats.length > 0 ? ['## Caveats', '', caveatList, ''] : []),
+    '## Legend',
+    '',
+    '- **✅ / ❌** — the capability is supported or unsupported for this provider.',
+    '- **Unknown** — the provider has not declared whether this reporting channel is supported.',
+    '- **✅¹ (superscript)** — supported, but with semantics that differ from the headline',
+    '  meaning of the axis — see [Caveats](#caveats).',
+    '- **Structured output** — `enforced` (the SDK/backend grammar-constrains decoding),',
+    '  `best-effort` (the model is asked for the schema, then validated + re-asked up to 3×),',
+    '  or ❌ (unsupported). See [AI Assistants → Structured output guarantees](/getting-started/ai-assistants/#structured-output-guarantees).',
+    '- **In-process native tools** — the provider can register Archon `NativeTool`s for a',
+    "  turn. It gates auto-injection of Archon's `invoke_workflow` and `register_project` tools",
+    '  into every chat, and of `manage_run` into project-scoped chat. Providers without it',
+    '  use the existing CLI for run launch and management after project selection.',
+    '  These launches are detached and headless, with CLI identity and no originating-chat',
+    '  delivery. Registration requires an explicit user command; assistant prose has no effects.',
+    '',
+    'For per-provider field-level notes (YAML syntax, caveats), see the',
+    '[AI Assistants guide](/getting-started/ai-assistants/).',
+    '',
+  ].join('\n');
+}
+
+async function main(): Promise<void> {
+  registerInProcessProviders();
+  const providers = getRegisteredProviders();
+  if (providers.length === 0) {
+    throw new Error('No providers registered — registry bootstrap failed.');
+  }
+  assertTotalCoverage();
+  const caveats = resolveCaveats(providers);
+
+  const contents = buildMarkdown(providers, caveats);
+
+  if (CHECK_ONLY) {
+    let existing = '';
+    try {
+      existing = (await readFile(OUTPUT_PATH, 'utf-8')).replace(/\r\n/g, '\n');
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code !== 'ENOENT') throw err;
+    }
+    if (existing !== contents) {
+      console.error(
+        "provider-capabilities.md is stale vs the providers' capabilities.ts.\nRun: bun run generate:capability-matrix"
+      );
+      process.exit(2);
+    }
+    console.log('check:capability-matrix OK');
+    return;
+  }
+
+  await writeFile(OUTPUT_PATH, contents, 'utf-8');
+  console.log(`Generated ${OUTPUT_PATH} (${providers.length} providers, ${AXES.length} axes)`);
+}
+
+if (import.meta.main) {
+  main().catch(err => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

@@ -1,0 +1,192 @@
+/**
+ * Core type definitions for the Remote Coding Agent platform
+ */
+import type { ResolvedWorkflow } from '@archon/workflows/schemas/workflow';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { RunModelOverrides } from '@archon/workflows/model-validation';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
+
+// TokenUsage is used by IPlatformAdapter below.
+import type { TokenUsage } from '@archon/providers/types';
+import type { PlatformStructuredEvent, WorkflowMessageMetadata } from '@archon/workflows/deps';
+
+// Re-export schema-derived types so existing imports from '@archon/core/types' keep working.
+export type {
+  Conversation,
+  IdentityPlatform,
+  User,
+  UserIdentity,
+  UserRole,
+  Codebase,
+  Session,
+  SessionMetadata,
+} from '../schemas';
+export { sessionMetadataSchema, identityPlatformSchema } from '../schemas';
+
+/**
+ * Custom error for when a conversation is not found during update operations
+ * Allows callers to programmatically handle this specific error case
+ */
+export class ConversationNotFoundError extends Error {
+  constructor(public conversationId: string) {
+    super(`Conversation not found: ${conversationId}`);
+    this.name = 'ConversationNotFoundError';
+  }
+}
+
+import type { RunActor } from '../operations/run-authorization';
+export type { RunActor } from '../operations/run-authorization';
+
+import type { IsolationHints } from '@archon/isolation';
+
+export interface AttachedFile {
+  /** Absolute path on disk where the file was saved by the server */
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
+export interface HandleMessageContext {
+  readonly issueContext?: string;
+  readonly threadContext?: string;
+  readonly parentConversationId?: string;
+  readonly isolationHints?: IsolationHints;
+  readonly attachedFiles?: AttachedFile[];
+  readonly actor: RunActor;
+  /**
+   * Set ONLY by the `POST /api/workflows/:name/run` route: start this workflow with the
+   * message, byte for byte, as its `$ARGUMENTS`. The message is never parsed as a command,
+   * so no word in it can change the run (#4159).
+   */
+  readonly workflowName?: string;
+  /**
+   * Declared workflow inputs supplied by the caller (#2554), keyed by input name.
+   *
+   * Set ONLY by the `POST /api/workflows/:name/run` route, whose body carries an
+   * `inputs` map. It rides the context rather than the message text so a supplied value
+   * is never confused with `$ARGUMENTS`. Chat launches never populate this field; they
+   * carry inputs on the `invoke_workflow` launch instead.
+   */
+  readonly workflowInputs?: Readonly<Record<string, string>>;
+  /** Sparse tier/@alias rebindings supplied by the workflow run route (#2481). */
+  readonly workflowModelOverrides?: RunModelOverrides;
+  /** Validated inline config content supplied by the workflow run route. */
+  readonly workflowRunConfig?: WorkflowRunConfigInput;
+  /**
+   * Between-run continuation (#2747): the terminal run this run adopts or
+   * supersedes. Rides the context like `workflowInputs` so it can never be
+   * confused with message text. Provenance is recorded engine-side; lane
+   * resolution is the dispatching surface's job.
+   */
+  readonly workflowAdoptRunId?: string;
+  readonly workflowSupersedesRunId?: string;
+}
+
+export type WorkflowRequest =
+  | {
+      kind: 'start';
+      definition: ResolvedWorkflow;
+      args: string;
+      force?: boolean;
+      /** Keys the engine dropped from this workflow's YAML (#2213). */
+      parseWarnings?: readonly string[];
+    }
+  | { kind: 'resume'; run: WorkflowRun };
+
+export interface CommandResult {
+  success: boolean;
+  message: string;
+  modified?: boolean; // Indicates if conversation state was modified
+  /** If set, orchestrator should execute this workflow request. */
+  workflow?: WorkflowRequest;
+}
+
+export type MessageMetadata = WorkflowMessageMetadata;
+
+export { toPersistedMessageMetadata } from './message-metadata';
+
+export interface IPlatformAdapter {
+  readonly capabilities: {
+    readonly messagePersistence: 'core' | 'adapter';
+    readonly canDetachProject?: true;
+    readonly defaultWorkflowDispatch: 'foreground' | 'background';
+  };
+
+  /** The returned finalizer is awaited when dispatch setup or worker execution ends. */
+  prepareBackgroundConversation?(context: {
+    workerConversationId: string;
+    parentConversationId: string;
+    conversationDbId: string;
+  }): Promise<() => Promise<void>>;
+
+  /**
+   * Send a message to the platform
+   */
+  sendMessage(conversationId: string, message: string, metadata?: MessageMetadata): Promise<void>;
+
+  /**
+   * Ensure responses go to a thread, creating one if needed.
+   * Returns the thread's conversation ID to use for subsequent messages.
+   *
+   * @param originalConversationId - The conversation ID from the triggering message
+   * @param messageContext - Platform-specific context (e.g., Discord Message, Slack event)
+   * @returns Thread conversation ID (may be same as original if already in thread)
+   */
+  ensureThread(originalConversationId: string, messageContext?: unknown): Promise<string>;
+
+  /**
+   * Get the configured streaming mode
+   */
+  getStreamingMode(): 'stream' | 'batch';
+
+  /**
+   * Get the platform type identifier (e.g., 'telegram', 'github', 'slack')
+   */
+  getPlatformType(): string;
+
+  /**
+   * Start the platform adapter (e.g., begin polling, start webhook server)
+   */
+  start(): Promise<void>;
+
+  /**
+   * Stop the platform adapter gracefully
+   */
+  stop(): void;
+
+  /**
+   * Optional: Send a structured event (a tool call, a result, a status line or a dispatch) to the platform.
+   * Only implemented by adapters that can display rich structured data (e.g., Web UI).
+   * Other adapters (Telegram, Slack) continue using sendMessage() for formatted text.
+   */
+  sendStructuredEvent?(conversationId: string, event: PlatformStructuredEvent): Promise<void>;
+
+  /** Retract previously streamed text (used when workflow routing intercepts) */
+  emitRetract?(conversationId: string): Promise<void>;
+
+  /**
+   * Optional: how an operator types a workflow command on this surface, given the
+   * command after the verb prefix (`cancel <id>`). Absent means the chat grammar the
+   * core command handler parses, `/workflow <command>`.
+   */
+  formatWorkflowCommand?(command: string): string;
+
+  /**
+   * Optional: Append a small footer summarising cost / token usage / stop reason
+   * after a direct-chat assistant turn. Implemented by adapters that surface
+   * usage info in-band (e.g. Slack posts an italic context line). No-op for
+   * adapters that don't care; orchestrator skips the call when both `cost`
+   * and `tokens` are absent.
+   */
+  sendResultFooter?(
+    conversationId: string,
+    info: { cost?: number; tokens?: TokenUsage; stopReason?: string }
+  ): Promise<void>;
+}
+
+// Re-export workflow schema types for config-types.ts compatibility
+import type { ModelReasoningEffort, WebSearchMode } from '@archon/workflows/schemas/workflow';
+export type { ModelReasoningEffort, WebSearchMode };
+import type { EffortLevel, SandboxSettings } from '@archon/workflows/schemas/dag-node';
+export type { EffortLevel, SandboxSettings };

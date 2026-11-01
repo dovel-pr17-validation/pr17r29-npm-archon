@@ -1,0 +1,565 @@
+// @archon-test-isolated
+import { describe, expect, expectTypeOf, test } from 'bun:test';
+import type { z } from 'zod';
+import type { ProcessGroupStop } from '@archon/paths/plugin-process';
+import { processGroupStopSchema } from './run-owner-preparation';
+import { testTimeout } from '@archon/paths/test-utils';
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer, type Server, Socket } from 'node:net';
+import { dirname } from 'node:path';
+import {
+  canConnectToRunLiveOwner,
+  isRunOwnedByThisProcess,
+  requestRunLiveOwnerStop,
+  runLiveOwnerPath,
+  RunLiveOwnerStopUnavailableError,
+  startRunLiveOwner,
+  watchRunLiveOwner,
+  withRunLiveOwner,
+  type RunLiveOwnerWatchEvent,
+} from './run-live-owner';
+
+/**
+ * How long an in-process live-owner transition may take to become observable.
+ *
+ * Every wait in this file polls for a state this same process reaches, because the owner
+ * and its watchers run in-process, so one deadline covers them all. It is a setup deadline,
+ * not a test budget: it bounds how long a wait retries before reporting that the
+ * transition never happened, and says nothing about what the assertions may cost.
+ *
+ * This was the default on `waitFor`, which let every site share the number without
+ * naming it. `waitFor` no longer defaults, so a wait that needs a different deadline has
+ * to state one and say why rather than inherit this.
+ */
+const LIVE_OWNER_EVENT_DEADLINE_MS = 3_000;
+
+/**
+ * Several times the idle lease timeout that used to cut a slow stop off (#3516), and on the
+ * scale of the slowest stop a lease has had to outlive.
+ */
+const SLOW_STOP_IDLE_MS = 9_000;
+
+async function waitFor(check: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for live-owner event');
+    await Bun.sleep(5);
+  }
+}
+
+/** The typed refusal a stop request for `runId` rejects with. */
+async function stopRefusal(runId: string): Promise<RunLiveOwnerStopUnavailableError> {
+  const outcome = await requestRunLiveOwnerStop(runId).then(
+    lease => {
+      lease.release();
+      return undefined;
+    },
+    (error: unknown) => error
+  );
+  if (!(outcome instanceof RunLiveOwnerStopUnavailableError)) {
+    throw new Error(`Expected a RunLiveOwnerStopUnavailableError, got ${String(outcome)}`);
+  }
+  return outcome;
+}
+
+/** Wait for an in-process live-owner event at the deadline this file owns. */
+async function waitForOwnerEvent(check: () => boolean): Promise<void> {
+  await waitFor(check, LIVE_OWNER_EVENT_DEADLINE_MS);
+}
+
+async function listen(server: Server, path: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(path, resolve);
+  });
+}
+
+async function close(server: Server): Promise<void> {
+  await new Promise<void>(resolve => server.close(() => resolve()));
+}
+
+describe('run live owner', () => {
+  test('publishes one exact-run endpoint and treats a connection as a harmless probe', async () => {
+    const runId = `owner-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const owner = await startRunLiveOwner(runId);
+    try {
+      expect(await canConnectToRunLiveOwner(path)).toBe(true);
+      expect(owner.isStopRequested()).toBe(false);
+      await expect(startRunLiveOwner(runId)).rejects.toThrow(/already owned/);
+      if (process.platform !== 'win32') {
+        expect(statSync(dirname(path)).mode & 0o077).toBe(0);
+        expect(path).not.toContain(runId);
+      }
+    } finally {
+      await owner.close();
+    }
+    expect(await canConnectToRunLiveOwner(path)).toBe(false);
+    if (process.platform !== 'win32') {
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(path.replace(/\.sock$/, '.lock'))).toBe(false);
+    }
+  });
+
+  // Cancel decides "cooperative" from this: a run whose endpoint this process holds is
+  // executing here. A stale entry after close would let cancel release a run another
+  // process has since claimed.
+  test('reports this process as the owner only while its endpoint is open', async () => {
+    const runId = `this-process-${crypto.randomUUID()}`;
+    expect(isRunOwnedByThisProcess(runId)).toBe(false);
+    const owner = await startRunLiveOwner(runId);
+    try {
+      expect(isRunOwnedByThisProcess(runId)).toBe(true);
+    } finally {
+      await owner.close();
+    }
+    expect(isRunOwnedByThisProcess(runId)).toBe(false);
+  });
+
+  test('keeps concurrent run owners independent', async () => {
+    const firstId = `concurrent-first-${crypto.randomUUID()}`;
+    const secondId = `concurrent-second-${crypto.randomUUID()}`;
+    const firstPath = runLiveOwnerPath(firstId);
+    const secondPath = runLiveOwnerPath(secondId);
+    const first = await startRunLiveOwner(firstId);
+    const second = await startRunLiveOwner(secondId);
+    try {
+      expect(await canConnectToRunLiveOwner(firstPath)).toBe(true);
+      expect(await canConnectToRunLiveOwner(secondPath)).toBe(true);
+      await first.close();
+      expect(await canConnectToRunLiveOwner(firstPath)).toBe(false);
+      expect(await canConnectToRunLiveOwner(secondPath)).toBe(true);
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+
+  test('rings every watcher before normal close without also reporting disconnect', async () => {
+    const runId = `watchers-${crypto.randomUUID()}`;
+    const owner = await startRunLiveOwner(runId);
+    const first: RunLiveOwnerWatchEvent[] = [];
+    const second: RunLiveOwnerWatchEvent[] = [];
+    const firstWatch = await watchRunLiveOwner(runId, event => first.push(event));
+    const secondWatch = await watchRunLiveOwner(runId, event => second.push(event));
+    expect(firstWatch.kind).toBe('attached');
+    expect(secondWatch.kind).toBe('attached');
+
+    await owner.close();
+    await waitForOwnerEvent(() => first.length === 1 && second.length === 1);
+
+    expect(first).toEqual(['attention']);
+    expect(second).toEqual(['attention']);
+  });
+
+  test('closes and rings the owner when its wrapped execution rejects', async () => {
+    const runId = `rejected-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const events: RunLiveOwnerWatchEvent[] = [];
+    const executionError = new Error('execution failed');
+    let rejection: unknown;
+
+    try {
+      await withRunLiveOwner(runId, {}, async () => {
+        const watch = await watchRunLiveOwner(runId, event => events.push(event));
+        expect(watch.kind).toBe('attached');
+        throw executionError;
+      });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBe(executionError);
+    await waitForOwnerEvent(() => events.length === 1);
+    expect(events).toEqual(['attention']);
+    expect(await canConnectToRunLiveOwner(path)).toBe(false);
+  });
+
+  test('foreground and server owners refuse active stop without changing owner state', async () => {
+    const runId = `foreground-${crypto.randomUUID()}`;
+    const owner = await startRunLiveOwner(runId);
+    try {
+      const refusal = await stopRefusal(runId);
+      // A live owner answered: abandon must not read this as an absent owner (#2325).
+      expect(refusal.reason).toBe('not_detached');
+      expect(owner.isStopRequested()).toBe(false);
+    } finally {
+      await owner.close();
+    }
+  });
+
+  test('detached stop commit announces the controller handoff before close', async () => {
+    const runId = `detached-${crypto.randomUUID()}`;
+    const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
+    const events: RunLiveOwnerWatchEvent[] = [];
+    const watch = await watchRunLiveOwner(runId, event => events.push(event));
+    expect(watch.kind).toBe('attached');
+    const lease = await requestRunLiveOwnerStop(runId);
+    try {
+      expect(lease.pid).toBe(process.pid);
+      // This process never claimed a Windows job object, so its owner reports none.
+      expect(lease.windowsJob).toBeUndefined();
+      expect(owner.isStopRequested()).toBe(true);
+      await lease.commit();
+      await waitForOwnerEvent(() => events.includes('control_handoff'));
+      expect(events).toEqual(['control_handoff']);
+    } finally {
+      lease.release();
+      await owner.close();
+    }
+    await waitForOwnerEvent(() => events.includes('attention'));
+    expect(events).toEqual(['control_handoff', 'attention']);
+  });
+
+  test(
+    'holds a committed stop lease for as long as both ends are alive, however slow the stop',
+    async () => {
+      // A stop can wait seconds terminating and confirming the tree with nothing sent on
+      // the lease (#3516). An idle timer on either end used to close the lease during that
+      // wait, and the stop then refused a live owner. Idle past that window, then prove
+      // both ends still hold the lease.
+      const runId = `slow-stop-${crypto.randomUUID()}`;
+      const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
+      const lease = await requestRunLiveOwnerStop(runId);
+      try {
+        await lease.commit();
+        await Bun.sleep(SLOW_STOP_IDLE_MS);
+        expect(lease.isLive()).toBe(true);
+        expect(owner.isStopRequested()).toBe(true);
+      } finally {
+        lease.release();
+        await owner.close();
+      }
+    },
+    testTimeout(SLOW_STOP_IDLE_MS + 5_000)
+  );
+
+  test('reads the Windows job an owner reports, and refuses one that is not a name', async () => {
+    const runId = `windows-job-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    let windowsJob: unknown = 'Global\\archon-run-fixture';
+    const server = createServer(socket => {
+      socket.once('data', () => {
+        socket.write(`${JSON.stringify({ kind: 'detached', pid: 12345, windowsJob })}\n`);
+      });
+    });
+    await listen(server, path);
+    try {
+      const lease = await requestRunLiveOwnerStop(runId);
+      lease.release();
+      expect(lease.windowsJob).toBe('Global\\archon-run-fixture');
+
+      for (windowsJob of [42, '']) {
+        const refusal = await stopRefusal(runId);
+        expect(refusal.message).toContain('owner returned an invalid response');
+        expect(refusal.reason).toBe('unproven');
+      }
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
+  });
+
+  test('bounds close while a controller retains an uncommitted stop lease', async () => {
+    const runId = `retained-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
+    const client = new Socket();
+    await new Promise<void>((resolve, reject) => {
+      client.once('connect', resolve);
+      client.once('error', reject);
+      client.connect(path);
+    });
+    client.write('stop\n');
+    await waitForOwnerEvent(() => owner.isStopRequested());
+
+    const closing = owner.close();
+    expect(await canConnectToRunLiveOwner(path)).toBe(true);
+    expect(owner.isStopRequested()).toBe(true);
+
+    await closing;
+    expect(owner.isStopRequested()).toBe(false);
+    expect(await canConnectToRunLiveOwner(path)).toBe(false);
+    client.destroy();
+  });
+
+  test('refuses a stop when the owner closes before identifying itself', async () => {
+    const runId = `close-before-pid-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const server = createServer(socket => {
+      socket.once('data', () => socket.end());
+    });
+    await listen(server, path);
+    try {
+      const refusal = await stopRefusal(runId);
+      expect(refusal.message).toMatch(/owner (?:ended|closed) before identifying itself/);
+      // Something accepted the connection, so this is not proof that no owner exists.
+      expect(refusal.reason).toBe('unproven');
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
+  });
+
+  test('refuses a committed stop when the owner disconnects before acknowledging it', async () => {
+    const runId = `close-before-ready-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const server = createServer(socket => {
+      socket.setEncoding('utf8');
+      let request = '';
+      socket.on('data', chunk => {
+        request += chunk;
+        if (request.includes('stop\n')) {
+          socket.write(`${JSON.stringify({ kind: 'detached', pid: 12345 })}\n`);
+          request = request.replace('stop\n', '');
+        }
+        if (request.includes('terminate\n')) socket.destroy();
+      });
+    });
+    await listen(server, path);
+    try {
+      const lease = await requestRunLiveOwnerStop(runId);
+      try {
+        const outcome = await lease.commit().then(
+          () => undefined,
+          (error: unknown) => error
+        );
+        expect(outcome).toBeInstanceOf(Error);
+        expect(outcome).toMatchObject({
+          message: expect.stringMatching(/owner (?:ended|closed) before committing termination/),
+        });
+      } finally {
+        lease.release();
+      }
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
+  });
+
+  test('reports an unexpected post-handshake disconnect', async () => {
+    const runId = `abrupt-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const server = createServer(socket => {
+      socket.once('data', () => {
+        socket.write('watching\n');
+        socket.destroy();
+      });
+    });
+    await listen(server, path);
+    const events: RunLiveOwnerWatchEvent[] = [];
+    try {
+      const watch = await watchRunLiveOwner(runId, event => events.push(event));
+      expect(watch.kind).toBe('attached');
+      await waitForOwnerEvent(() => events.length > 0);
+      expect(events).toEqual(['disconnected']);
+    } finally {
+      await close(server);
+    }
+  });
+
+  test('reports an unreachable owner only when nothing accepts the connection', async () => {
+    // No endpoint at all: the path does not exist.
+    const absentRunId = `absent-${crypto.randomUUID()}`;
+    expect((await stopRefusal(absentRunId)).reason).toBe('unreachable');
+    expect(await watchRunLiveOwner(absentRunId, () => undefined)).toEqual({ kind: 'unreachable' });
+
+    // A socket left behind by an owner that died without closing refuses the
+    // connection. A second link keeps the socket inode when close() unlinks the path,
+    // which stages that residue without killing a process.
+    if (process.platform === 'win32') return;
+    const runId = `stale-stop-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const residue = `${path}.residue`;
+    const server = createServer(() => undefined);
+    await listen(server, path);
+    linkSync(path, residue);
+    await close(server);
+    renameSync(residue, path);
+    try {
+      expect((await stopRefusal(runId)).reason).toBe('unreachable');
+      expect(await watchRunLiveOwner(runId, () => undefined)).toEqual({ kind: 'unreachable' });
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+
+  test('does not read a live owner it cannot connect to as an absent owner', async () => {
+    // A live listener whose socket this user may not write to fails with EACCES. Only
+    // ENOENT and ECONNREFUSED prove nothing is listening; anything else must not let
+    // abandon record the run cancelled. Root bypasses the permission check.
+    if (process.platform === 'win32' || process.getuid?.() === 0) return;
+    const runId = `no-access-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const server = createServer(socket => socket.destroy());
+    await listen(server, path);
+    chmodSync(path, 0o000);
+    try {
+      const refusal = await stopRefusal(runId);
+      expect(refusal.detail).toBe('EACCES');
+      expect(refusal.reason).toBe('unproven');
+      expect(await watchRunLiveOwner(runId, () => undefined)).toEqual({ kind: 'unproven' });
+    } finally {
+      await close(server);
+      rmSync(path, { force: true });
+    }
+  });
+
+  test('recovers a stale POSIX endpoint only after connection refusal', async () => {
+    if (process.platform === 'win32') return;
+    const runId = `stale-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    writeFileSync(path, 'stale');
+    chmodSync(path, 0o600);
+
+    const owner = await startRunLiveOwner(runId);
+    try {
+      expect(await canConnectToRunLiveOwner(path)).toBe(true);
+    } finally {
+      await owner.close();
+    }
+  });
+});
+
+describe('detached owner preparation', () => {
+  test('prepares only on commit, streams inventory, and shares holds until the last controller releases', async () => {
+    const runId = `prepared-${crypto.randomUUID()}`;
+    const owner = await startRunLiveOwner(runId, { detachedProcessPid: process.pid });
+    let prepared = 0;
+    let released = 0;
+    let finish!: (warnings: string[]) => void;
+    const ready = new Promise<string[]>(resolve => {
+      finish = resolve;
+    });
+    const groups = Array.from({ length: 12 }, (_, i) => ({
+      pgid: 1000 + i,
+      leaderReaped: true as const,
+    }));
+    const unregister = owner.registerTerminationPreparation(() => {
+      prepared++;
+      return {
+        groups,
+        ready,
+        release: () => {
+          released++;
+        },
+      };
+    });
+    const first = await requestRunLiveOwnerStop(runId);
+    const second = await requestRunLiveOwnerStop(runId);
+    try {
+      expect(prepared).toBe(0);
+      const firstCommit = first.commit();
+      const secondCommit = second.commit();
+      await waitForOwnerEvent(() => prepared === 1);
+      let acknowledged = false;
+      void firstCommit.then(() => {
+        acknowledged = true;
+      });
+      await Bun.sleep(10);
+      expect(acknowledged).toBe(false);
+      finish(['Cleanup fixture warning']);
+      expect(await firstCommit).toEqual({ groups, warnings: ['Cleanup fixture warning'] });
+      expect(await secondCommit).toEqual({ groups, warnings: ['Cleanup fixture warning'] });
+      first.release();
+      await Bun.sleep(10);
+      expect(released).toBe(0);
+      second.release();
+      await waitForOwnerEvent(() => released === 1);
+      const third = await requestRunLiveOwnerStop(runId);
+      try {
+        expect((await third.commit())?.groups).toEqual(groups);
+        expect(prepared).toBe(2);
+      } finally {
+        third.release();
+      }
+      await waitForOwnerEvent(() => released === 2);
+      unregister();
+      const legacy = await requestRunLiveOwnerStop(runId);
+      try {
+        expect(await legacy.commit()).toBeUndefined();
+      } finally {
+        legacy.release();
+      }
+    } finally {
+      first.release();
+      second.release();
+      unregister();
+      await owner.close();
+    }
+  });
+
+  test.each([
+    ['malformed', '{"group":{"pgid":"invalid","leaderReaped":true}}', 'Invalid input'],
+    ['oversized', 'x'.repeat(257), 'Run owner acknowledgement exceeded its size limit'],
+    [
+      'contradictory group',
+      '{"group":{"pgid":1,"leaderReaped":true,"signalError":"EPERM"}}',
+      'Invalid input',
+    ],
+    ['mixed', '{"warning":"held output","group":{"pgid":1,"leaderReaped":false}}', 'Invalid input'],
+  ])(
+    'rejects %s preparation frames instead of acknowledging a stop',
+    async (_kind, frame, expectedError) => {
+      const runId = `invalid-preparation-${crypto.randomUUID()}`;
+      const path = runLiveOwnerPath(runId);
+      const sockets = new Set<Socket>();
+      const socketErrors: Error[] = [];
+      const requests: string[] = [];
+      const server = createServer(socket => {
+        sockets.add(socket);
+        socket.once('close', () => sockets.delete(socket));
+        // Rejection can close a Windows pipe while this fixture is still writing.
+        socket.on('error', error => {
+          socketErrors.push(error);
+          socket.destroy();
+        });
+        socket.setEncoding('utf8');
+        let pending = '';
+        socket.on('data', chunk => {
+          pending += chunk;
+          let newline = pending.indexOf('\n');
+          while (newline !== -1) {
+            const request = pending.slice(0, newline);
+            pending = pending.slice(newline + 1);
+            requests.push(request);
+            if (request === 'stop') socket.write('{"kind":"detached","pid":12345}\n');
+            if (request === 'terminate') socket.write(`preparing\n${frame}\nready\n`);
+            newline = pending.indexOf('\n');
+          }
+        });
+      });
+      await listen(server, path);
+      const lease = await requestRunLiveOwnerStop(runId);
+      try {
+        // Await pipe I/O before Bun's matchers, which synchronously pump the event loop.
+        const outcome = await lease.commit().then(
+          () => undefined,
+          (error: unknown) => error
+        );
+        expect(outcome).toBeInstanceOf(Error);
+        expect(outcome).toMatchObject({ message: expect.stringContaining(expectedError) });
+        expect(requests).toEqual(['stop', 'terminate']);
+      } finally {
+        lease.release();
+        for (const socket of sockets) socket.destroy();
+        await close(server);
+      }
+      for (const error of socketErrors) {
+        expect(error).toMatchObject({ code: expect.stringMatching(/^(EPIPE|ECONNRESET)$/) });
+      }
+    }
+  );
+});
+
+test('lease group frames conform to the process owner facts', () => {
+  expectTypeOf<z.output<typeof processGroupStopSchema>>().toEqualTypeOf<ProcessGroupStop>();
+});

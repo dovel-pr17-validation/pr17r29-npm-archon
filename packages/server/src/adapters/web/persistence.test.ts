@@ -1,0 +1,532 @@
+import { describe, test, expect, beforeEach, mock, afterEach } from 'bun:test';
+
+// Mock logger before importing module under test
+mock.module('@archon/paths', () => ({
+  createLogger: () => ({
+    fatal: mock(() => undefined),
+    error: mock(() => undefined),
+    warn: mock(() => undefined),
+    info: mock(() => undefined),
+    debug: mock(() => undefined),
+    trace: mock(() => undefined),
+  }),
+}));
+
+// Mock @archon/core/db/messages
+const mockAddMessage = mock<
+  (...args: Parameters<typeof import('@archon/core/db/messages')['addMessage']>) => Promise<void>
+>(async () => {});
+mock.module('@archon/core/db/messages', () => ({
+  addMessage: mockAddMessage,
+}));
+
+// Import after mocks are set up
+const { MessagePersistence } = await import('./persistence');
+
+function createPersistence(): InstanceType<typeof MessagePersistence> {
+  const emitEvent = mock(() => Promise.resolve());
+  return new MessagePersistence(emitEvent);
+}
+
+describe('MessagePersistence', () => {
+  let persistence: InstanceType<typeof MessagePersistence>;
+
+  beforeEach(() => {
+    persistence = createPersistence();
+    mockAddMessage.mockClear();
+  });
+
+  afterEach(() => {
+    persistence.stopPeriodicFlush();
+    persistence.clearAll();
+  });
+
+  test.each(['patch text', 0, false, null, ['a', 1]].map(input => [input] as const))(
+    'persists non-object tool input %j',
+    async input => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendToolCall('conv-1', { toolCallId: 'patch', name: 'apply_patch', input });
+      await persistence.flush('conv-1');
+      expect(mockAddMessage.mock.calls[0]?.[3]).toMatchObject({ toolCalls: [{ input }] });
+    }
+  );
+
+  describe('flush — sync-clear before async work (race condition fix)', () => {
+    test('clears buffer before async db write so new appendText creates fresh entry', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'hello');
+
+      // Trigger flush (it will atomically clear the buffer before the db write)
+      const flushPromise = persistence.flush('conv-1');
+
+      // Append text while flush is in progress — should go to a new buffer entry
+      persistence.appendText('conv-1', 'world');
+
+      await flushPromise;
+
+      // 'hello' should have been persisted
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      expect(mockAddMessage.mock.calls[0][2]).toBe('hello');
+
+      // 'world' should still be in the buffer (not flushed yet)
+      // Flush again to verify it persisted the second batch
+      await persistence.flush('conv-1');
+      expect(mockAddMessage).toHaveBeenCalledTimes(2);
+      expect(mockAddMessage.mock.calls[1][2]).toBe('world');
+    });
+
+    test('restores buffer when dbId is missing (no segments lost)', async () => {
+      // Do NOT call setConversationDbId — flush should restore
+      persistence.appendText('conv-1', 'buffered text');
+
+      await persistence.flush('conv-1');
+
+      // Buffer should be restored since no dbId was available
+      // Now provide the dbId and flush again
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      expect(mockAddMessage.mock.calls[0][2]).toBe('buffered text');
+    });
+
+    test('restore preserves buffer intact after no-dbId flush', async () => {
+      // Verify that when flush() is called with no dbId, the buffer is fully
+      // restored so subsequent text is still persisted once dbId becomes available.
+      persistence.appendText('conv-1', 'segment-1 ');
+
+      await persistence.flush('conv-1'); // no dbId — restores buffer
+
+      // Text appended after restore merges into the restored buffer entry
+      persistence.appendText('conv-1', 'segment-2');
+
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      await persistence.flush('conv-1');
+
+      // Both texts end up in one db write (same segment, no segment boundary between them)
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      expect(mockAddMessage.mock.calls[0][2]).toBe('segment-1 segment-2');
+    });
+
+    test('flush on empty buffer is a no-op', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      await persistence.flush('conv-1');
+      expect(mockAddMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  test.each([1, 2])(
+    'stops after persistence write %s fails and warns without retrying',
+    async failAt => {
+      const emitEvent = mock(async (_conversationId: string, _event: string) => {});
+      persistence = new MessagePersistence(emitEvent);
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'first');
+      persistence.appendText('conv-1', 'second', { segment: 'new' });
+      persistence.appendText('conv-1', 'third', { segment: 'new' });
+      if (failAt === 2) mockAddMessage.mockResolvedValueOnce(undefined);
+      mockAddMessage.mockRejectedValueOnce(new Error('write rejected'));
+
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage.mock.calls.map(call => call[2])).toEqual(
+        failAt === 1 ? ['first'] : ['first', 'second']
+      );
+      expect(emitEvent).toHaveBeenCalledTimes(1);
+      expect(emitEvent.mock.calls[0]?.[0]).toBe('conv-1');
+      expect(JSON.parse(emitEvent.mock.calls[0]?.[1] ?? '{}')).toEqual({
+        type: 'warning',
+        message: 'Assistant response could not be saved to history',
+        timestamp: expect.any(Number),
+      });
+      await persistence.flush('conv-1');
+      expect(mockAddMessage).toHaveBeenCalledTimes(failAt);
+      persistence.appendText('conv-1', 'new response');
+      await persistence.flush('conv-1');
+      expect(mockAddMessage.mock.calls.at(-1)?.[2]).toBe('new response');
+    }
+  );
+
+  describe('startPeriodicFlush / stopPeriodicFlush', () => {
+    test('startPeriodicFlush is idempotent (double call does not create two timers)', () => {
+      persistence.startPeriodicFlush();
+      persistence.startPeriodicFlush(); // second call should be a no-op
+
+      // We can't directly inspect the timer ID, but we can verify stopPeriodicFlush
+      // cleans up without error and subsequent operations still work.
+      persistence.stopPeriodicFlush();
+      persistence.stopPeriodicFlush(); // should not throw
+    });
+
+    test('stopPeriodicFlush is safe to call when no timer is running', () => {
+      // Should not throw
+      persistence.stopPeriodicFlush();
+    });
+
+    test('startPeriodicFlush / stopPeriodicFlush lifecycle', () => {
+      persistence.startPeriodicFlush();
+      // Timer is running — no assertion needed beyond no-throw
+      persistence.stopPeriodicFlush();
+      // Timer is cleared — no assertion needed beyond no-throw
+    });
+
+    test('timer can be restarted after stop', () => {
+      persistence.startPeriodicFlush();
+      persistence.stopPeriodicFlush();
+      // Starting again should work without errors
+      persistence.startPeriodicFlush();
+      persistence.stopPeriodicFlush();
+    });
+  });
+
+  describe('appendText', () => {
+    test('buffers text in segments', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'hello ');
+      persistence.appendText('conv-1', 'world');
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      expect(mockAddMessage.mock.calls[0][2]).toBe('hello world');
+    });
+
+    test('skips tool_call_formatted category', () => {
+      persistence.appendText('conv-1', 'skip me', { category: 'tool_call_formatted' });
+      // Buffer should be empty — nothing to flush
+      // Verify by flushing and checking no db write
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      // Flush is async but we can check the buffer is empty
+      void persistence.flush('conv-1');
+      expect(mockAddMessage).not.toHaveBeenCalled();
+    });
+
+    test('skips isolation_context category', () => {
+      persistence.appendText('conv-1', 'skip me', { category: 'isolation_context' });
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      void persistence.flush('conv-1');
+      expect(mockAddMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('retractLastSegment', () => {
+    test('removes last segment', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'first segment');
+      persistence.appendText('conv-1', 'second segment', { segment: 'new' });
+
+      persistence.retractLastSegment('conv-1');
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      expect(mockAddMessage.mock.calls[0][2]).toBe('first segment');
+    });
+
+    test('clears text but preserves tool calls when segment has tool calls', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'routing text');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-1',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+
+      // Retract should only clear text, not the tool call
+      persistence.retractLastSegment('conv-1');
+      await persistence.flush('conv-1');
+
+      // DB write should happen (because tool call is preserved)
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      // Content should be empty string (text retracted)
+      expect(mockAddMessage.mock.calls[0][2]).toBe('');
+      // Tool calls should still be persisted
+      const metadata = mockAddMessage.mock.calls[0][3] as { toolCalls?: { name: string }[] };
+      expect(metadata?.toolCalls).toHaveLength(1);
+      expect(metadata?.toolCalls?.[0]?.name).toBe('bash');
+    });
+
+    test('retract on empty buffer is a no-op', () => {
+      // Should not throw
+      persistence.retractLastSegment('nonexistent-conv');
+    });
+
+    test('retract text-only segment removes it entirely', async () => {
+      persistence.appendText('conv-1', 'some text');
+      persistence.retractLastSegment('conv-1');
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      await persistence.flush('conv-1');
+      expect(mockAddMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('appendToolCall', () => {
+    test('buffers tool calls and persists them in flush metadata', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'checking file');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-2',
+        name: 'read',
+        input: { path: '/tmp/test.ts' },
+      });
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { name: string; input: Record<string, unknown>; duration?: number }[];
+      };
+      expect(metadata?.toolCalls).toHaveLength(1);
+      expect(metadata?.toolCalls?.[0]?.name).toBe('read');
+      expect(metadata?.toolCalls?.[0]?.input).toEqual({ path: '/tmp/test.ts' });
+      // Duration should be set by flush finalization
+      expect(metadata?.toolCalls?.[0]?.duration).toBeGreaterThanOrEqual(0);
+    });
+
+    test('finalizes previous tool duration when new tool arrives', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'working');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-3',
+        name: 'read',
+        input: { path: 'a.ts' },
+      });
+      // Small delay to get measurable duration
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-4',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+      await persistence.flush('conv-1');
+
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { name: string; duration?: number }[];
+      };
+      expect(metadata?.toolCalls).toHaveLength(2);
+      // First tool should have a duration (finalized by second tool arrival)
+      expect(metadata?.toolCalls?.[0]?.duration).toBeGreaterThanOrEqual(0);
+    });
+
+    test('text after tool call starts a new segment', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'before tool');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-5',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+      persistence.appendText('conv-1', 'after tool');
+      await persistence.flush('conv-1');
+
+      // Should produce 2 messages: one with text+tool, one with post-tool text
+      expect(mockAddMessage).toHaveBeenCalledTimes(2);
+      expect(mockAddMessage.mock.calls[0][2]).toBe('before tool');
+      expect(mockAddMessage.mock.calls[1][2]).toBe('after tool');
+    });
+  });
+
+  describe('appendToolResult', () => {
+    test('should include tool output when flushing to DB', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'running bash');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-6',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+      persistence.appendToolResult('conv-1', 'call-6', 'file1.txt\nfile2.txt', 250);
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { name: string; output?: string; duration?: number }[];
+      };
+      expect(metadata?.toolCalls).toHaveLength(1);
+      expect(metadata?.toolCalls?.[0]?.name).toBe('bash');
+      expect(metadata?.toolCalls?.[0]?.output).toBe('file1.txt\nfile2.txt');
+      expect(metadata?.toolCalls?.[0]?.duration).toBe(250);
+    });
+
+    test('should persist empty-string output (not undefined)', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'running tool');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-7',
+        name: 'bash',
+        input: { command: 'echo' },
+      });
+      persistence.appendToolResult('conv-1', 'call-7', '', 100);
+      await persistence.flush('conv-1');
+
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { output?: string }[];
+      };
+      // Empty string output should be persisted (not dropped like falsy ||-based logic would)
+      expect(metadata?.toolCalls?.[0]?.output).toBe('');
+    });
+
+    test('should be a no-op when no buffer exists', () => {
+      // Should not throw
+      persistence.appendToolResult('nonexistent', 'call-x', 'output', 100);
+    });
+
+    test('matches the tool call by id, not by name', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'two bash calls');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-8',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-9',
+        name: 'bash',
+        input: { command: 'pwd' },
+      });
+      // The earlier call finishes first; name matching would give its output to the later one.
+      persistence.appendToolResult('conv-1', 'call-8', 'output-for-first', 200);
+      await persistence.flush('conv-1');
+
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { name: string; output?: string }[];
+      };
+      expect(metadata?.toolCalls).toHaveLength(2);
+      expect(metadata?.toolCalls?.[0]?.output).toBe('output-for-first');
+      expect(metadata?.toolCalls?.[1]?.output).toBeUndefined();
+    });
+
+    test('persists how the tool call ended', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-12',
+        name: 'bash',
+        input: { command: 'false' },
+      });
+      persistence.appendToolResult('conv-1', 'call-12', '', 50, { status: 'failed', exitCode: 1 });
+      await persistence.flush('conv-1');
+
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { status?: string; exitCode?: number }[];
+      };
+      expect(metadata?.toolCalls?.[0]).toMatchObject({ status: 'failed', exitCode: 1 });
+    });
+  });
+
+  describe('flush — pre-finalization of terminal tool calls', () => {
+    test('flushes segment when last tool call never received a result', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'running tool');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-10',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+      // No appendToolResult — simulates terminal tool call at turn end
+
+      await persistence.flush('conv-1');
+
+      // The segment must be flushed (not held as pending)
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { name: string; duration?: number }[];
+      };
+      // Duration must be set (pre-finalized), not undefined
+      expect(metadata?.toolCalls?.[0]?.duration).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('finalizeRunningTools', () => {
+    test('sets duration on the last running tool', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'text');
+      persistence.appendToolCall('conv-1', {
+        toolCallId: 'call-11',
+        name: 'bash',
+        input: { command: 'ls' },
+      });
+      persistence.finalizeRunningTools('conv-1');
+      await persistence.flush('conv-1');
+
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        toolCalls?: { duration?: number }[];
+      };
+      expect(metadata?.toolCalls?.[0]?.duration).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('flush — category persisted in metadata (#2576)', () => {
+    test('persists workflow_result category so reloaded history renders the result card', async () => {
+      // Console's ChatStream gates the workflow-result card on `message.category === 'workflow_result'`.
+      // Before the fix the web adapter dropped `category` at flush time, so the gate was always false
+      // after a reload — exactly the regression the issue reports.
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      const workflowResult = { workflowName: 'review', runId: 'run-123' };
+      persistence.appendText('conv-1', 'result payload', {
+        category: 'workflow_result',
+        workflowResult,
+      });
+
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as {
+        category?: string;
+        workflowResult?: { workflowName: string; runId: string };
+      };
+      expect(metadata?.category).toBe('workflow_result');
+      expect(metadata?.workflowResult).toEqual(workflowResult);
+    });
+
+    test('persists workflow_status category alongside content', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', '🚀 starting', { category: 'workflow_status' });
+
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as { category?: string };
+      expect(metadata?.category).toBe('workflow_status');
+    });
+
+    test('persists workflow_dispatch_status category', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', '✅ done', { category: 'workflow_dispatch_status' });
+
+      await persistence.flush('conv-1');
+
+      const metadata = mockAddMessage.mock.calls[0][3] as { category?: string };
+      expect(metadata?.category).toBe('workflow_dispatch_status');
+    });
+
+    test('omits category key entirely when segment has no category (CLI parity)', async () => {
+      // Mirrors the CLI adapter's conditional spread shape: only set the key when present.
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      persistence.appendText('conv-1', 'plain text');
+
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as Record<string, unknown>;
+      expect('category' in metadata).toBe(false);
+    });
+  });
+
+  describe('flush — future MessageMetadata fields persist by derivation (#2709)', () => {
+    test('a new field on the buffered metadata flows through to addMessage', async () => {
+      // Simulates adding a brand-new field to MessageMetadata. With the old
+      // hand-maintained per-field copy, this field would be silently dropped
+      // at flush time. With the shared helper, the new field reaches the DB
+      // without editing this adapter.
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+      // The assertion admits a field MessageMetadata does not declare yet.
+      persistence.appendText('conv-1', 'plain text', {
+        category: 'workflow_status',
+        traceId: 'trace-abc',
+      } as Parameters<typeof persistence.appendText>[2]);
+
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage).toHaveBeenCalledTimes(1);
+      const metadata = mockAddMessage.mock.calls[0][3] as Record<string, unknown>;
+      expect(metadata?.category).toBe('workflow_status');
+      expect(metadata?.traceId).toBe('trace-abc');
+    });
+  });
+});

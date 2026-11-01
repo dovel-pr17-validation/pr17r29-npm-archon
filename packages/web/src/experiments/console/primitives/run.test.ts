@@ -1,0 +1,669 @@
+import { describe, test, expect } from 'bun:test';
+import { toRun, normalizeOrigin, runDetailPath, runMessageConversationId } from './run';
+import { detailFixture } from './run.test-fixtures';
+import { runStatusLabel } from '../lib/run-status';
+
+type Raw = Parameters<typeof toRun>[0];
+
+function raw(
+  over: Partial<Raw> & { id: string; workflow_name: string; status: Raw['status'] }
+): Raw {
+  return {
+    codebase_id: null,
+    started_at: '2026-06-05T10:00:00Z',
+    ...over,
+  };
+}
+
+describe('normalizeOrigin', () => {
+  test('maps each known platform_type to its RunOrigin', () => {
+    expect(normalizeOrigin('web')).toBe('web');
+    expect(normalizeOrigin('cli')).toBe('cli');
+    expect(normalizeOrigin('slack')).toBe('slack');
+    expect(normalizeOrigin('telegram')).toBe('telegram');
+    expect(normalizeOrigin('discord')).toBe('discord');
+    expect(normalizeOrigin('github')).toBe('github');
+  });
+
+  test('is case-insensitive', () => {
+    expect(normalizeOrigin('CLI')).toBe('cli');
+    expect(normalizeOrigin('GitHub')).toBe('github');
+  });
+
+  test('null, undefined, and unknown strings fall back to "unknown"', () => {
+    expect(normalizeOrigin(null)).toBe('unknown');
+    expect(normalizeOrigin(undefined)).toBe('unknown');
+    expect(normalizeOrigin('carrier-pigeon')).toBe('unknown');
+  });
+});
+
+describe('runDetailPath', () => {
+  test('uses the project-scoped route for assigned runs', () => {
+    expect(runDetailPath({ id: 'run-1', projectId: 'project-1' })).toBe(
+      '/console/p/project-1/r/run-1'
+    );
+  });
+
+  test('uses the projectless route for unassigned runs', () => {
+    expect(runDetailPath({ id: 'run-1', projectId: null })).toBe('/console/r/run-1');
+  });
+});
+
+describe('toRun — provenance', () => {
+  test('preserves the assigned project for project-scoped routing', () => {
+    const run = toRun(
+      raw({
+        id: 'run-1',
+        workflow_name: 'implement',
+        status: 'running',
+        codebase_id: 'project-1',
+      })
+    );
+
+    expect(run.projectId).toBe('project-1');
+    expect(runDetailPath(run)).toBe('/console/p/project-1/r/run-1');
+  });
+
+  test('keeps every parallel active node', () => {
+    const parallel = toRun(
+      raw({
+        id: 'r-parallel',
+        workflow_name: 'implement',
+        status: 'running',
+        active_nodes: ['parallel-a', 'parallel-b'],
+      })
+    );
+
+    expect(parallel.activeNodes).toEqual(['parallel-a', 'parallel-b']);
+  });
+
+  test('detail responses without active_nodes normalize to empty active state', () => {
+    const detail = toRun(raw({ id: 'r-detail', workflow_name: 'plan', status: 'running' }));
+
+    expect(detail.activeNodes).toEqual([]);
+  });
+
+  test('keeps authored outcome independent from execution status', () => {
+    const completedWithSucceededOutcome = toRun(
+      raw({
+        id: 'r0',
+        workflow_name: 'review',
+        status: 'completed',
+        outcome: 'succeeded',
+      })
+    );
+    const completedWithFailedOutcome = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'review',
+        status: 'completed',
+        outcome: 'failed',
+      })
+    );
+    const pausedWithSucceededOutcome = toRun(
+      raw({
+        id: 'r2',
+        workflow_name: 'review',
+        status: 'paused',
+        outcome: 'succeeded',
+      })
+    );
+
+    expect(completedWithSucceededOutcome.status).toBe('completed');
+    expect(completedWithSucceededOutcome.outcome).toBe('succeeded');
+    expect(completedWithFailedOutcome.status).toBe('completed');
+    expect(completedWithFailedOutcome.outcome).toBe('failed');
+    expect(pausedWithSucceededOutcome.status).toBe('paused');
+    expect(pausedWithSucceededOutcome.outcome).toBe('succeeded');
+  });
+
+  test('normalizes an absent authored outcome to null', () => {
+    const r = toRun(raw({ id: 'r1', workflow_name: 'plan', status: 'completed' }));
+    expect(r.outcome).toBeNull();
+  });
+
+  test('userMessage defaults to empty string when absent', () => {
+    const r = toRun(raw({ id: 'r1', workflow_name: 'plan', status: 'running' }));
+    expect(r.userMessage).toBe('');
+  });
+
+  test('userMessage passes through when present', () => {
+    const r = toRun(
+      raw({ id: 'r1', workflow_name: 'plan', status: 'running', user_message: 'summarise PRs' })
+    );
+    expect(r.userMessage).toBe('summarise PRs');
+  });
+
+  test('origin is derived from platform_type', () => {
+    const r = toRun(
+      raw({ id: 'r1', workflow_name: 'plan', status: 'running', platform_type: 'web' })
+    );
+    expect(r.origin).toBe('web');
+  });
+
+  test('detail-sourced row still populates conversationPlatformId (unchanged behavior)', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'plan',
+        status: 'completed',
+        conversation_platform_id: 'cli-detail-789',
+      })
+    );
+    expect(r.conversationPlatformId).toBe('cli-detail-789');
+  });
+
+  test('worker_platform_id maps through for chat-dispatched runs; absent → null', () => {
+    const web = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'plan',
+        status: 'completed',
+        worker_platform_id: 'web-worker-123-abc',
+      })
+    );
+    expect(web.workerPlatformId).toBe('web-worker-123-abc');
+    expect(web.conversationPlatformId).toBeNull();
+
+    const bare = toRun(raw({ id: 'r2', workflow_name: 'plan', status: 'completed' }));
+    expect(bare.workerPlatformId).toBeNull();
+  });
+
+  test("normalizes the transient 'pending' status to running", () => {
+    const r = toRun(raw({ id: 'r1', workflow_name: 'plan', status: 'pending' }));
+    expect(r.status).toBe('running');
+  });
+});
+
+describe('runMessageConversationId', () => {
+  test('CLI run: uses conversationPlatformId (unchanged behavior)', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'plan',
+        status: 'completed',
+        conversation_platform_id: 'cli-1776237248436-q61o4h',
+      })
+    );
+    expect(runMessageConversationId(r)).toBe('cli-1776237248436-q61o4h');
+  });
+
+  test('chat-dispatched run: falls back to the worker conversation (#2048)', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'plan',
+        status: 'completed',
+        conversation_platform_id: null,
+        worker_platform_id: 'web-worker-1784559376043-8p44vw',
+      })
+    );
+    expect(runMessageConversationId(r)).toBe('web-worker-1784559376043-8p44vw');
+  });
+
+  test('prefers conversationPlatformId when both are present', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'plan',
+        status: 'completed',
+        conversation_platform_id: 'cli-abc',
+        worker_platform_id: 'web-worker-xyz',
+      })
+    );
+    expect(runMessageConversationId(r)).toBe('cli-abc');
+  });
+
+  test('list-sourced row (neither field) → null, message fetching stays off', () => {
+    const r = toRun(raw({ id: 'r1', workflow_name: 'plan', status: 'running' }));
+    expect(runMessageConversationId(r)).toBeNull();
+  });
+
+  test('not-yet-loaded run (undefined) → null', () => {
+    expect(runMessageConversationId(undefined)).toBeNull();
+  });
+});
+
+describe('toRun — cost', () => {
+  test('reads a positive total_cost_usd from metadata', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'plan',
+        status: 'completed',
+        metadata: { total_cost_usd: 1.5 },
+      })
+    );
+    expect(r.costUsd).toBe(1.5);
+  });
+
+  test('preserves a reported zero cost', () => {
+    const zero = toRun(
+      raw({ id: 'r1', workflow_name: 'plan', status: 'completed', metadata: { total_cost_usd: 0 } })
+    );
+    expect(zero.costUsd).toBe(0);
+  });
+
+  test('cost is null when metadata is absent', () => {
+    expect(toRun(raw({ id: 'r1', workflow_name: 'plan', status: 'completed' })).costUsd).toBeNull();
+  });
+
+  test.each([undefined, 'free', null, -1, Number.NaN, Infinity, -Infinity])(
+    'cost is null for missing or invalid total_cost_usd %s',
+    totalCost => {
+      expect(
+        toRun(
+          raw({
+            id: 'r1',
+            workflow_name: 'plan',
+            status: 'completed',
+            metadata: { total_cost_usd: totalCost },
+          })
+        ).costUsd
+      ).toBeNull();
+    }
+  );
+});
+
+describe('toRun — approval parsing', () => {
+  test.each(['child-full-id', undefined])(
+    'normalizes legacy child command prose using structured child ID %s',
+    childRunId => {
+      const run = toRun(
+        raw({
+          id: 'parent',
+          workflow_name: 'parent',
+          status: 'paused',
+          metadata: {
+            approval: {
+              nodeId: 'sub',
+              type: 'child_workflow',
+              childRunId,
+              message: 'Blocked on child. Approve it: /workflow approve legacy-prose-id',
+            },
+          },
+        })
+      );
+      expect(run.approval?.message).toBe(
+        childRunId
+          ? `Waiting on sub-run ${childRunId}. Review the child run to continue.`
+          : 'Waiting on a sub-run. Review the child run to continue.'
+      );
+      expect(run.approval?.message).not.toContain('/workflow');
+      expect(run.approval?.message).not.toContain('legacy-prose-id');
+    }
+  );
+
+  test('keeps an authored vocabulary and its labels without synthesizing default choices', () => {
+    const decisions = [
+      { id: 'accept', label: 'Accept plan' },
+      { id: 'revise', label: 'Revise plan' },
+    ];
+    const run = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'review',
+        status: 'paused',
+        metadata: {
+          approval: { nodeId: 'gate', message: 'Choose', decisionsAuthored: true, decisions },
+        },
+      })
+    );
+    expect(run.approval?.decisions).toEqual(decisions);
+    expect(run.approval?.decisionsAuthored).toBe(true);
+  });
+
+  test('keeps default decisions supplied by the API', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'review',
+        status: 'paused',
+        metadata: {
+          approval: {
+            nodeId: 'gate',
+            message: 'Approve?',
+            decisions: [{ id: 'approve' }, { id: 'reject' }],
+          },
+        },
+      })
+    );
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
+  });
+
+  test('surfaces completionSignaled on a signal-bearing interactive-loop gate (#2074)', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'validate',
+        status: 'paused',
+        metadata: {
+          approval: {
+            nodeId: 'refine',
+            message: 'gate',
+            type: 'interactive_loop',
+            completionSignaled: true,
+            signaledOutput: 'REPORT',
+          },
+        },
+      })
+    );
+    expect(r.approval?.completionSignaled).toBe(true);
+  });
+
+  test('approval is null when absent', () => {
+    expect(toRun(raw({ id: 'r1', workflow_name: 'review', status: 'paused' })).approval).toBeNull();
+  });
+});
+
+describe('toRun — resolved gate (approved/rejected awaiting resume)', () => {
+  test('resolved approval hides the pending gate and sets gateResolved', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'review',
+        status: 'paused',
+        metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'approved' } },
+      })
+    );
+    // No stale approve/reject buttons for an already-resolved gate.
+    expect(r.approval).toBeNull();
+    expect(r.gateResolved).toBe('approved');
+  });
+
+  test('resolved rejection maps to gateResolved: rejected', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'review',
+        status: 'paused',
+        metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'rejected' } },
+      })
+    );
+    expect(r.approval).toBeNull();
+    expect(r.gateResolved).toBe('rejected');
+  });
+
+  test('explicit null resolved (fresh pause) keeps the gate pending', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'review',
+        status: 'paused',
+        metadata: {
+          approval: {
+            nodeId: 'gate',
+            message: 'Approve?',
+            resolved: null,
+            decisions: [{ id: 'approve' }, { id: 'reject' }],
+          },
+        },
+      })
+    );
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
+    expect(r.gateResolved).toBeNull();
+  });
+});
+
+describe('toRun — durable wait', () => {
+  type RawWait = NonNullable<NonNullable<Raw['metadata']>['wait']>;
+  type NormalizedWait = NonNullable<ReturnType<typeof toRun>['wait']>;
+
+  const waitingSince = '2026-08-25T09:00:00.000Z';
+  const resumeAt = '2026-08-25T10:00:00.000Z';
+  const cases: Array<{
+    name: string;
+    wait: RawWait;
+    expected: NormalizedWait;
+    label: string;
+  }> = [
+    {
+      name: 'node time',
+      wait: { owner: 'node', nodeId: 'delay', kind: 'time', waitingSince, resumeAt },
+      expected: { nodeId: 'delay', kind: 'time', waitingSince, resumeAt },
+      label: 'Waiting until scheduled time',
+    },
+    {
+      name: 'node event',
+      wait: {
+        owner: 'node',
+        nodeId: 'checks',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+        signaledAt: resumeAt,
+        payload: { conclusion: 'success' },
+      },
+      expected: {
+        nodeId: 'checks',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+        signaledAt: resumeAt,
+        payload: { conclusion: 'success' },
+      },
+      label: 'Waiting for event',
+    },
+    {
+      name: 'node attention',
+      wait: {
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      expected: {
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      label: 'Waiting for action',
+    },
+    {
+      name: 'node usage limit',
+      wait: {
+        owner: 'node',
+        nodeId: 'implement',
+        kind: 'quota',
+        pauseId: 'limit-1',
+        waitingSince,
+        resumeAt,
+      },
+      expected: {
+        nodeId: 'implement',
+        kind: 'quota',
+        pauseId: 'limit-1',
+        waitingSince,
+        resumeAt,
+      },
+      label: 'Waiting for provider limit',
+    },
+    {
+      name: 'loop-group time',
+      wait: {
+        owner: 'loop_group',
+        nodeId: 'poll',
+        bodyWaitId: 'delay',
+        iteration: 2,
+        sessionId: null,
+        sessionProvider: null,
+        kind: 'time',
+        waitingSince,
+        resumeAt,
+      },
+      expected: { nodeId: 'poll.delay', kind: 'time', waitingSince, resumeAt },
+      label: 'Waiting until scheduled time',
+    },
+    {
+      name: 'loop-group event',
+      wait: {
+        owner: 'loop_group',
+        nodeId: 'poll',
+        bodyWaitId: 'checks',
+        iteration: 3,
+        sessionId: 'session-1',
+        sessionProvider: 'claude',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+      },
+      expected: {
+        nodeId: 'poll.checks',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+      },
+      label: 'Waiting for event',
+    },
+    {
+      name: 'loop-group attention',
+      wait: {
+        owner: 'loop_group',
+        nodeId: 'recover-ci',
+        bodyWaitId: 'pause',
+        iteration: 14,
+        sessionId: null,
+        sessionProvider: null,
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      expected: {
+        nodeId: 'recover-ci.pause',
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      label: 'Waiting for action',
+    },
+  ];
+
+  for (const waitCase of cases) {
+    test(`normalizes ${waitCase.name} from the generated wait contract`, () => {
+      const r = toRun(
+        raw({
+          id: 'r1',
+          workflow_name: 'durable-wait',
+          status: 'paused',
+          metadata: {
+            approval: { nodeId: 'old-gate', message: 'Stale approval' },
+            wait: waitCase.wait,
+          },
+        })
+      );
+
+      expect(r.wait).toEqual(waitCase.expected);
+      expect(r.approval).toBeNull();
+      expect(runStatusLabel(r)).toBe(waitCase.label);
+    });
+  }
+});
+
+describe('stop reason', () => {
+  // Typed against the generated metadata contract, so a test cannot assert on a stop
+  // reason the API could never return.
+  const interrupted = (
+    stopReason: NonNullable<Raw['metadata']>['stop_reason']
+  ): ReturnType<typeof toRun> =>
+    toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'implement',
+        status: 'failed',
+        metadata: {
+          error: 'Process terminated (SIGINT)',
+          ...(stopReason === undefined ? {} : { stop_reason: stopReason }),
+        },
+      })
+    );
+
+  test('carries the persisted stop reason onto the run', () => {
+    expect(interrupted({ reason: 'process_terminated', signal: 'SIGINT' }).stopReason).toEqual({
+      reason: 'process_terminated',
+      signal: 'SIGINT',
+    });
+    expect(interrupted(undefined).stopReason).toBeNull();
+  });
+
+  // A signal stop is the one failure the operator caused on purpose, and the run is still
+  // resumable — labelling it `Failed` is what sends them looking for a bug (#3479).
+  test('labels a signal stop Interrupted, naming the signal', () => {
+    expect(runStatusLabel(interrupted({ reason: 'process_terminated', signal: 'SIGINT' }))).toBe(
+      'Interrupted (SIGINT)'
+    );
+    expect(runStatusLabel(interrupted({ reason: 'process_terminated', signal: 'SIGTERM' }))).toBe(
+      'Interrupted (SIGTERM)'
+    );
+    expect(runStatusLabel(interrupted({ reason: 'process_terminated' }))).toBe('Interrupted');
+  });
+
+  test('a genuine execution failure keeps saying Failed', () => {
+    expect(runStatusLabel(interrupted({ reason: 'node_error' }))).toBe('Failed');
+    expect(runStatusLabel(interrupted(undefined))).toBe('Failed');
+  });
+});
+
+describe('toRun — terminal record', () => {
+  test('preserves the full record and authored value without flattening', () => {
+    expect(toRun(detailFixture.run)).toHaveProperty(
+      'terminalRecord',
+      detailFixture.run.terminal_record
+    );
+  });
+
+  test('normalizes missing and null records to null', () => {
+    expect(toRun(raw({ id: 'r1', workflow_name: 'plan', status: 'completed' }))).toHaveProperty(
+      'terminalRecord',
+      null
+    );
+    expect(toRun({ ...detailFixture.run, terminal_record: null })).toHaveProperty(
+      'terminalRecord',
+      null
+    );
+  });
+});
+
+test('running advisories are normalized through API metadata and disappear for terminal rows', () => {
+  const call = {
+    streamId: 's',
+    nodeId: 'node',
+    provider: 'codex',
+    toolCallId: 'call',
+    name: 'bash',
+    startedAt: '2026-10-01T00:00:00Z',
+    lastProgressAt: '2026-10-01T00:00:00Z',
+    raisedAt: '2026-10-01T00:30:00Z',
+    thresholdMs: 1800000,
+  };
+  const metadata = { tool_call_attention: [call] };
+  const live = toRun(raw({ id: 'live', workflow_name: 'work', status: 'running', metadata }));
+  expect(live.toolCallAttention).toEqual([call]);
+  expect(runStatusLabel(live)).toBe('Running · tool call needs attention');
+  // A stalled tool call keeps naming its cause when the owner is also gone or unobservable.
+  for (const observation of ['unreachable', 'unknown'] as const)
+    expect(runStatusLabel({ ...live, ownerObservation: observation })).toBe(
+      'Running · tool call needs attention'
+    );
+  expect(
+    toRun(raw({ id: 'done', workflow_name: 'work', status: 'completed', metadata }))
+      .toolCallAttention
+  ).toEqual([]);
+});
